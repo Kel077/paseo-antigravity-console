@@ -167,7 +167,49 @@ function initial(label: string): string {
   return first.toLocaleUpperCase();
 }
 
-export function Avatar({ colors, label, icon, size = 40 }: { colors: Colors; label: string; icon?: string; size?: number }) {
+/** A stable, readable hue per account so accounts are easy to tell apart. */
+export function hueFor(seed: string): number {
+  let hash = 0;
+  for (const char of seed) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  // Skip the reds (status colors) and keep hues that read well on light and dark surfaces.
+  const palette = [212, 262, 190, 152, 32, 330, 236, 172];
+  return palette[hash % palette.length]!;
+}
+
+export function Avatar({
+  colors,
+  label,
+  logo,
+  hue,
+  size = 40,
+}: {
+  colors: Colors;
+  label: string;
+  /** Inline SVG drawn on a neutral tile instead of an initial. */
+  logo?: string;
+  hue?: number;
+  size?: number;
+}) {
+  if (logo) {
+    return (
+      <View
+        style={{
+          width: size,
+          height: size,
+          borderRadius: size * 0.3,
+          alignItems: "center",
+          justifyContent: "center",
+          backgroundColor: colors.surface0,
+          borderWidth: 1,
+          borderColor: colors.border,
+        }}
+      >
+        <Icon icon={{ svg: logo }} size={Math.round(size * 0.6)} color={colors.foreground} />
+      </View>
+    );
+  }
+  const ink = hue === undefined ? colors.accent : `hsl(${hue}, 62%, 50%)`;
+  const wash = hue === undefined ? tint(colors.accent, 0.16) : `hsla(${hue}, 62%, 50%, 0.16)`;
   return (
     <View
       style={{
@@ -176,14 +218,10 @@ export function Avatar({ colors, label, icon, size = 40 }: { colors: Colors; lab
         borderRadius: size / 2,
         alignItems: "center",
         justifyContent: "center",
-        backgroundColor: icon ? tint(colors.foreground, 0.07) : tint(colors.accent, 0.16),
+        backgroundColor: wash,
       }}
     >
-      {icon ? (
-        <Icon name={icon} size={Math.round(size * 0.45)} color={colors.foreground} />
-      ) : (
-        <Text style={{ fontSize: Math.round(size * 0.42), fontWeight: "600", color: colors.accent }}>{initial(label)}</Text>
-      )}
+      <Text style={{ fontSize: Math.round(size * 0.42), fontWeight: "600", color: ink }}>{initial(label)}</Text>
     </View>
   );
 }

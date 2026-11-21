@@ -6,8 +6,9 @@ import type { AccountSummary, QuotaBucket, QuotaGroup } from "../shared/contract
 import { percent, relative } from "./format";
 import { displayLabel } from "./labels";
 import { messages } from "./messages";
-import { font, radius, remainingTone, space, tabular, tint, type Colors, type Tone } from "./theme";
-import { Avatar, Badge, Bar, Button, Callout, Card, Divider, IconButton, Muted } from "./ui";
+import { font, radius, remainingTone, space, tabular, tint, toneColor, type Colors, type Tone } from "./theme";
+import { antigravityLogo } from "./logo";
+import { Avatar, Badge, Bar, Button, Callout, Card, Divider, hueFor, IconButton, Muted } from "./ui";
 
 export type CardAction = "refresh" | "rename" | "makeDefault" | "signIn" | "signOut" | "remove";
 
@@ -23,51 +24,84 @@ function statusTone(account: AccountSummary): Tone {
   }
 }
 
-function QuotaRows({ colors, group, now, locale }: { colors: Colors; group: QuotaGroup; now: number; locale: string }) {
+type KnownWindow = "weekly" | "5h" | "daily" | "monthly";
+
+function windowName(bucket: QuotaBucket, siblings: readonly QuotaBucket[], named: (key: KnownWindow) => string): string {
+  const key = bucket.window.trim().toLowerCase();
+  const known = key === "weekly" || key === "5h" || key === "daily" || key === "monthly";
+  const base = known ? named(key) : bucket.window;
+  // Two buckets with the same period in one group (rare): tell them apart by name.
+  const same = siblings.filter((other) => other.window.trim().toLowerCase() === key).length;
+  return same > 1 ? `${base} · ${bucket.name}` : base;
+}
+
+function Meter({
+  colors,
+  bucket,
+  label,
+  now,
+  locale,
+}: {
+  colors: Colors;
+  bucket: QuotaBucket | null;
+  label: string;
+  now: number;
+  locale: string;
+}) {
   const { t } = useTranslation(messages);
-  const windows = group.buckets.map((bucket) => bucket.window.trim().toLowerCase());
-  const label = (bucket: QuotaBucket, index: number) => {
-    const key = windows[index];
-    const known = key === "weekly" || key === "5h" || key === "daily" || key === "monthly";
-    const base = known ? t(`window.${key}`) : bucket.window;
-    // Two buckets with the same period in one group (rare): tell them apart by name.
-    return windows.indexOf(key!) !== windows.lastIndexOf(key!) ? `${base} · ${bucket.name}` : base;
-  };
+  // An empty slot keeps a lone meter at half width, so groups line up across cards.
+  if (!bucket) return <View style={{ flex: 1 }} />;
+  const fraction = bucket.remainingFraction;
+  const tone = bucket.disabled ? "neutral" : remainingTone(fraction);
+  return (
+    <View style={{ flex: 1, minWidth: 0, gap: 6 }}>
+      <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
+        <Text numberOfLines={1} style={{ ...font.small, color: colors.foregroundMuted, flex: 1 }}>
+          {label}
+        </Text>
+        <Text
+          style={{
+            ...font.small,
+            ...tabular,
+            fontWeight: "600",
+            color: bucket.disabled
+              ? colors.foregroundMuted
+              : tone === "warning" || tone === "danger"
+                ? toneColor(colors, tone)
+                : colors.foreground,
+          }}
+        >
+          {bucket.disabled ? t("off") : fraction === null ? "—" : percent(fraction, locale)}
+        </Text>
+      </View>
+      <Bar colors={colors} fraction={bucket.disabled ? 0 : (fraction ?? 0)} tone={tone} height={5} />
+      {/* Always one line tall, so cards with and without reset times line up. */}
+      <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
+        {bucket.resetTime && !bucket.disabled ? t("resets", { time: relative(bucket.resetTime, now, locale) }) : "\u00a0"}
+      </Text>
+    </View>
+  );
+}
+
+function QuotaGroupView({ colors, group, now, locale, compact }: { colors: Colors; group: QuotaGroup; now: number; locale: string; compact: boolean }) {
+  const { t: translate } = useTranslation(messages);
+  const t = (key: KnownWindow) => translate(`window.${key}`);
+  // Two meters per row: the usual pair is weekly and 5-hour.
+  const rows: Array<[QuotaBucket, QuotaBucket | null]> = [];
+  for (let index = 0; index < group.buckets.length; index += 2) {
+    rows.push([group.buckets[index]!, group.buckets[index + 1] ?? null]);
+  }
   return (
     <View style={{ gap: space.sm }}>
-      <Text style={{ ...font.overline, color: colors.foregroundMuted }}>{group.name.toLocaleUpperCase(locale)}</Text>
-      {group.buckets.map((bucket, index) => {
-        const fraction = bucket.remainingFraction;
-        const tone = bucket.disabled ? "neutral" : remainingTone(fraction);
-        return (
-          <View key={bucket.id} style={{ gap: 4 }}>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: space.md }}>
-              <Text numberOfLines={1} style={{ ...font.small, color: colors.foreground, width: 76 }}>
-                {label(bucket, index)}
-              </Text>
-              <View style={{ flex: 1 }}>
-                <Bar colors={colors} fraction={bucket.disabled ? 0 : (fraction ?? 0)} tone={tone} />
-              </View>
-              <Text
-                style={{
-                  ...font.small,
-                  ...tabular,
-                  width: 52,
-                  textAlign: "right",
-                  fontWeight: "600",
-                  color: bucket.disabled ? colors.foregroundMuted : colors.foreground,
-                }}
-              >
-                {bucket.disabled ? t("off") : fraction === null ? "—" : percent(fraction, locale)}
-              </Text>
-            </View>
-            {/* Always one line tall, so cards with and without reset times line up row by row. */}
-            <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted, marginLeft: 76 + space.md }}>
-              {bucket.resetTime && !bucket.disabled ? t("resets", { time: relative(bucket.resetTime, now, locale) }) : "\u00a0"}
-            </Text>
-          </View>
-        );
-      })}
+      <Text numberOfLines={1} style={{ ...font.overline, color: colors.foregroundMuted }}>
+        {group.name.toLocaleUpperCase(locale)}
+      </Text>
+      {rows.map(([left, right]) => (
+        <View key={left.id} style={{ flexDirection: "row", gap: compact ? space.lg : space.xl }}>
+          <Meter colors={colors} bucket={left} label={windowName(left, group.buckets, t)} now={now} locale={locale} />
+          <Meter colors={colors} bucket={right} label={right ? windowName(right, group.buckets, t) : ""} now={now} locale={locale} />
+        </View>
+      ))}
     </View>
   );
 }
@@ -117,6 +151,7 @@ export function AccountCard({
   count,
   now,
   busy,
+  compact,
   onAction,
 }: {
   account: AccountSummary;
@@ -124,6 +159,7 @@ export function AccountCard({
   count: number | undefined;
   now: number;
   busy: CardAction | null;
+  compact: boolean;
   onAction(action: CardAction): void;
 }) {
   const { t, locale } = useTranslation(messages);
@@ -156,7 +192,7 @@ export function AccountCard({
     <Card colors={colors} style={{ flex: 1, zIndex: menuOpen ? 10 : 0, overflow: "visible" }}>
       <View style={{ flex: 1, padding: space.lg, gap: space.md }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.md }}>
-          <Avatar colors={colors} label={name} icon={isProfile ? undefined : "KeyRound"} />
+          <Avatar colors={colors} label={name} logo={isProfile ? undefined : antigravityLogo} hue={isProfile ? hueFor(account.id) : undefined} />
           <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, height: 24 }}>
               <Text numberOfLines={1} style={{ ...font.heading, color: colors.foreground, flexShrink: 1 }}>
@@ -211,15 +247,15 @@ export function AccountCard({
             ) : (
               <View style={{ gap: space.lg }}>
                 {account.quota.map((group) => (
-                  <QuotaRows key={group.name} colors={colors} group={group} now={now} locale={locale} />
+                  <QuotaGroupView key={group.name} colors={colors} group={group} now={now} locale={locale} compact={compact} />
                 ))}
               </View>
             )}
           </>
         ) : null}
 
-        <View style={{ flex: 1 }} />
-        <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, marginTop: space.xs }}>
+        {/* Auto margin pins the footer to the bottom of an equal-height card without an extra gap. */}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, marginTop: "auto", paddingTop: space.xs }}>
           <View style={{ flex: 1 }}>
             <Muted colors={colors} small>
               {justChecked

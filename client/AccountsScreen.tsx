@@ -18,7 +18,8 @@ import { displayLabel } from "./labels";
 import { errorMessage, messages } from "./messages";
 import { SignIn } from "./signIn";
 import { font, radius, space, tint, type Colors } from "./theme";
-import { Button, Callout, Card, Muted } from "./ui";
+import { antigravityLogo } from "./logo";
+import { Avatar, Button, Callout, Card, Muted } from "./ui";
 import { useAccounts } from "./useAccounts";
 
 type Dialog =
@@ -172,11 +173,14 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding, alignItems: "center" }}>
         <View style={{ width: contentWidth || "100%", maxWidth: 980, gap: space.xxl }}>
           <View style={{ flexDirection: compact ? "column" : "row", alignItems: compact ? "stretch" : "flex-end", gap: space.lg }}>
-            <View style={{ flex: compact ? undefined : 1, gap: space.xs }}>
-              <Text accessibilityRole="header" style={{ ...font.title, color: colors.foreground }}>
-                {t("title")}
-              </Text>
-              <Text style={{ ...font.body, color: colors.foregroundMuted }}>{t("subtitle")}</Text>
+            <View style={{ flex: compact ? undefined : 1, flexDirection: "row", alignItems: "center", gap: space.lg }}>
+              <Avatar colors={colors} label="A" logo={antigravityLogo} size={compact ? 44 : 52} />
+              <View style={{ flex: 1, gap: space.xs }}>
+                <Text accessibilityRole="header" style={{ ...font.title, color: colors.foreground }}>
+                  {t("title")}
+                </Text>
+                <Text style={{ ...font.body, color: colors.foregroundMuted }}>{t("subtitle")}</Text>
+              </View>
             </View>
             <View style={{ flexDirection: "row", gap: space.sm }}>
               <Button
@@ -269,6 +273,7 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
                         count={counts ? (counts.get(account.id) ?? 0) : undefined}
                         now={now}
                         busy={busy[account.id] ?? null}
+                        compact={compact}
                         onAction={(action) => onAction(account, action)}
                       />
                     </View>
