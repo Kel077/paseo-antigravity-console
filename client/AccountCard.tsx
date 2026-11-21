@@ -61,11 +61,10 @@ function QuotaRows({ colors, group, now, locale }: { colors: Colors; group: Quot
                 {bucket.disabled ? t("off") : fraction === null ? "—" : percent(fraction, locale)}
               </Text>
             </View>
-            {bucket.resetTime && !bucket.disabled ? (
-              <Text style={{ ...font.caption, color: colors.foregroundMuted, marginLeft: 76 + space.md }}>
-                {t("resets", { time: relative(bucket.resetTime, now, locale) })}
-              </Text>
-            ) : null}
+            {/* Always one line tall, so cards with and without reset times line up row by row. */}
+            <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted, marginLeft: 76 + space.md }}>
+              {bucket.resetTime && !bucket.disabled ? t("resets", { time: relative(bucket.resetTime, now, locale) }) : "\u00a0"}
+            </Text>
           </View>
         );
       })}
@@ -154,12 +153,12 @@ export function AccountCard({
   };
 
   return (
-    <Card colors={colors} style={{ zIndex: menuOpen ? 10 : 0, overflow: "visible" }}>
-      <View style={{ padding: space.lg, gap: space.md }}>
+    <Card colors={colors} style={{ flex: 1, zIndex: menuOpen ? 10 : 0, overflow: "visible" }}>
+      <View style={{ flex: 1, padding: space.lg, gap: space.md }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.md }}>
           <Avatar colors={colors} label={name} icon={isProfile ? undefined : "KeyRound"} />
           <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, height: 24 }}>
               <Text numberOfLines={1} style={{ ...font.heading, color: colors.foreground, flexShrink: 1 }}>
                 {name}
               </Text>
@@ -219,6 +218,7 @@ export function AccountCard({
           </>
         ) : null}
 
+        <View style={{ flex: 1 }} />
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, marginTop: space.xs }}>
           <View style={{ flex: 1 }}>
             <Muted colors={colors} small>

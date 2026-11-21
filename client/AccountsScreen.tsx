@@ -262,7 +262,7 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
                 </View>
                 <View style={{ flexDirection: "row", flexWrap: "wrap", gap }}>
                   {data.accounts.map((account, index) => (
-                    <View key={account.id} style={{ width: cardWidth || "100%", zIndex: data.accounts.length - index }}>
+                    <View key={account.id} style={{ width: cardWidth || "100%", alignSelf: "stretch", zIndex: data.accounts.length - index }}>
                       <AccountCard
                         account={account}
                         colors={colors}
