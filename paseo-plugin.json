@@ -1,0 +1,9 @@
+{
+  "id": "antigravity-accounts",
+  "media": [],
+  "requirements": {
+    "paseo": ">=0.16.2"
+  },
+  "name": "Antigravity Accounts",
+  "description": "Use several Google accounts with the built-in Antigravity provider and switch an agent between them without losing its conversation."
+}
