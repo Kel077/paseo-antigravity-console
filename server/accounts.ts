@@ -150,6 +150,11 @@ export class AccountService {
     await Promise.all(ids.map((id) => this.refreshOne(id)));
   }
 
+  /** Last known status without probing. */
+  knownStatus(accountId: string): AccountSummary["status"] {
+    return this.runtime.get(accountId)?.status ?? "unknown";
+  }
+
   /** Last known quota, probing first when nothing is known yet. */
   async quotaFor(accountId: string, maxAgeMs: number): Promise<RuntimeStatus> {
     const current = this.runtime.get(accountId);

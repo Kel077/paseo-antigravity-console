@@ -180,7 +180,8 @@ export async function probeAccount(agyPath: string, accountId: string): Promise<
               name: bucket.name,
               window: bucket.window,
               remainingFraction: bucket.remaining_fraction ?? null,
-              resetTime: bucket.reset_time ?? null,
+              // Unused buckets report the Unix epoch instead of a reset time.
+              resetTime: bucket.reset_time && !bucket.reset_time.startsWith("1970-01-01") ? bucket.reset_time : null,
               disabled: bucket.disabled === true,
             })),
           })),

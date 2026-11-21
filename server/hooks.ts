@@ -50,6 +50,13 @@ export async function switchAgentAccount(
   const target = service.requireAccount(input.accountId);
   if (target?.unsafeDetail) throw new Error(target.unsafeDetail);
   const accountLabel = service.labelOf(input.accountId);
+  if (target) {
+    // Moving an agent onto an account that cannot run would strand it there.
+    const status = await service.quotaFor(input.accountId, 5 * 60_000);
+    if (status.status === "signed-out") {
+      throw new Error(`Sign in to "${accountLabel}" in Antigravity accounts before moving an agent to it.`);
+    }
+  }
   const handle = paseo.agents.ref(input.agentId);
   const refreshed = await handle.refresh();
   if (!refreshed) throw new Error("That agent no longer exists.");
@@ -71,7 +78,21 @@ export async function switchAgentAccount(
     return { result: "scheduled", accountLabel };
   }
   pending.delete(input.agentId);
-  await handle.reload();
+  try {
+    await handle.reload();
+  } catch (error) {
+    // Put the agent back where it worked, then report why the new account failed.
+    const reason = error instanceof Error ? error.message : String(error);
+    await handle.setMetadata({ [ACCOUNT_METADATA_KEY]: current }).catch(() => undefined);
+    const restored = await handle.reload().then(
+      () => true,
+      () => false,
+    );
+    throw new Error(
+      `"${accountLabel}" could not open this agent: ${reason}` +
+        (restored ? ` The agent stays on "${service.labelOf(current)}".` : ""),
+    );
+  }
   return { result: "switched", accountLabel };
 }
 
@@ -90,6 +111,14 @@ export function registerHooks(
       if (typeof metadata[ACCOUNT_METADATA_KEY] === "string") return undefined;
       const state = await service.state();
       if (state.defaultAccountId === SYSTEM_ACCOUNT_ID) return undefined;
+      const account = service.store.get(state.defaultAccountId);
+      if (!account || account.unsafeDetail || service.knownStatus(account.id) === "signed-out") {
+        // A default that cannot run would make every new agent fail; leave it on the system sign-in.
+        console.warn(
+          `antigravity-accounts: default account ${state.defaultAccountId} cannot run; new agent stays on the system sign-in`,
+        );
+        return undefined;
+      }
       return {
         ...request,
         metadata: { ...metadata, [ACCOUNT_METADATA_KEY]: state.defaultAccountId },
