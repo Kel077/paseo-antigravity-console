@@ -131,6 +131,7 @@ export async function readConversationUsage(
   const file = path.join(conversations, `${conversationId}.db`);
   const stat = await fs.stat(file).catch(() => null);
   if (!stat?.isFile()) return null;
+  const walStat = await fs.stat(`${file}-wal`).catch(() => null);
   const module = await loadSqlite();
   if (!module) return null;
   let db: InstanceType<SqliteModule["DatabaseSync"]> | null = null;
@@ -161,7 +162,8 @@ export async function readConversationUsage(
       cached: latest.cached,
       output: latest.output,
       sizeSource: window ? "agy" : guessed ? "model" : null,
-      updatedAt: stat.mtime.toISOString(),
+      // agy writes through a WAL; the main file's time only moves at checkpoints.
+      updatedAt: new Date(Math.max(stat.mtimeMs, walStat?.mtimeMs ?? 0)).toISOString(),
       model,
     };
   } catch (error) {
