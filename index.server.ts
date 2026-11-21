@@ -1,6 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   cancelSignInRpc,
+  contextUsageRpc,
   createAccountRpc,
   listAccountsRpc,
   refreshAccountsRpc,
@@ -14,12 +15,14 @@ import {
   watchAccountsSubscription,
 } from "./shared/contracts";
 import { AccountService } from "./server/accounts";
+import { ContextReader } from "./server/context";
 import { PendingSwitches, registerHooks, switchAgentAccount } from "./server/hooks";
 import { createUsageSource } from "./server/usage";
 
 export default function contribute(server: PluginServerContext) {
   const service = new AccountService();
   const pending = new PendingSwitches();
+  const context = new ContextReader();
   const ready = service.init();
 
   // Learn every account's state once in the background so the composer can show it.
@@ -100,13 +103,15 @@ export default function contribute(server: PluginServerContext) {
     return switchAgentAccount(paseo, service, pending, input);
   });
 
-  server.handle(watchAccountsSubscription, async (_input, { push, signal }) => {
-    await ready;
+  server.handle(contextUsageRpc, async ({ agentIds }, { paseo }) => context.usage(paseo, agentIds));
+
+  // Must return synchronously: a returned promise closes the subscription when it settles.
+  server.handle(watchAccountsSubscription, (_input, { push, signal }) => {
     const stop = service.onChange((revision) => {
       void push({ revision }).catch(() => undefined);
     });
     signal.addEventListener("abort", stop, { once: true });
-    await push({ revision: service.currentRevision() });
+    void ready.then(() => push({ revision: service.currentRevision() })).catch(() => undefined);
   });
 
   return () => {

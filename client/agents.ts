@@ -1,7 +1,26 @@
-import type { PluginButton, PluginButtonMenuEntry, PluginButtonRegistration, PluginClientContext, PluginText } from "@getpaseo/plugin/client";
+import type {
+  PluginButton,
+  PluginButtonMenuEntry,
+  PluginButtonRegistration,
+  PluginClientContext,
+  PluginText,
+} from "@getpaseo/plugin/client";
 import { useToast, type ToastApi } from "@getpaseo/plugin/client/ui";
 import { useEffect } from "react";
-import { accountIdFromMetadata, isAntigravityProvider, listAccountsRpc, switchAgentAccountRpc, watchAccountsSubscription, type AccountsState, type AccountSummary } from "../shared/contracts";
+import {
+  accountIdFromMetadata,
+  contextUsageRpc,
+  isAntigravityProvider,
+  listAccountsRpc,
+  switchAgentAccountRpc,
+  watchAccountsSubscription,
+  type AccountsState,
+  type AccountSummary,
+  type ContextUsage,
+} from "../shared/contracts";
+import { ContextPopover, contextStore } from "./context";
+import { percent, tokens } from "./format";
+import { displayLabel } from "./labels";
 import { messages } from "./messages";
 
 type AgentRow = {
@@ -14,20 +33,23 @@ type AgentRow = {
 };
 type Member = { id: string; workspace: string | null; account: string; running: boolean };
 type Counts = ReadonlyMap<string, number>;
-type Schedule = typeof setTimeout;
-type Timer = ReturnType<Schedule>;
+type Timer = ReturnType<typeof setTimeout>;
+
+const CONTEXT_POLL_MS = 5000;
 
 export function observeAgents(client: PluginClientContext) {
   const lifetime = new AbortController();
   const agents = new Map<string, Member>();
-  const pills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const accountPills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const contextPills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const nativeContext = new Set<string>();
   const listeners = new Set<() => void>();
   const presenters = new Map<symbol, ToastApi>();
   let pendingNotice: string | undefined;
   let counts: Counts | null = null;
   let accounts: AccountsState | undefined;
 
-  // Commands have no toast API. Mounted host surfaces lend their installation's presenter.
+  // Commands have no toast API of their own; mounted plugin surfaces lend theirs.
   function notify(message: string) {
     if (lifetime.signal.aborted) return;
     const presenter = presenters.values().next().value;
@@ -39,84 +61,204 @@ export function observeAgents(client: PluginClientContext) {
     useEffect(() => {
       const key = Symbol();
       presenters.set(key, toast);
-      if (pendingNotice) { notify(pendingNotice); pendingNotice = undefined; }
-      return () => { presenters.delete(key); };
+      if (pendingNotice) {
+        notify(pendingNotice);
+        pendingNotice = undefined;
+      }
+      return () => {
+        presenters.delete(key);
+      };
     }, [toast]);
   }
+
+  const nameOf = (label: string) => displayLabel(label, (key) => client.i18n.t(messages, key));
+
   async function switchTo(agentId: string, account: AccountSummary, when: "now" | "after-turn") {
     const result = await client.rpc(switchAgentAccountRpc, { agentId, accountId: account.id, when });
-    notify(client.i18n.t(messages, result.result, { label: result.accountLabel }));
+    notify(client.i18n.t(messages, result.result, { label: nameOf(result.accountLabel) }));
   }
-  function renderPill(agent: Member) {
+
+  // ---- Account pill -------------------------------------------------------------------------
+
+  function renderAccountPill(agent: Member) {
     if (!agent.workspace) return;
-    const choices: PluginButtonMenuEntry<PluginText>[] = (accounts?.accounts ?? []).map(account => {
+    const current = accounts?.accounts.find((account) => account.id === agent.account);
+    const healthy = !current || (current.usable && current.status !== "signed-out");
+    const choices: PluginButtonMenuEntry<PluginText>[] = (accounts?.accounts ?? []).map((account) => {
       const selected = account.id === agent.account;
+      const unavailable = !account.usable || account.status === "signed-out";
       const action = (when: "now" | "after-turn") => ({
-        kind: "action" as const, onPress: () => switchTo(agent.id, account, when),
+        kind: "action" as const,
+        onPress: () => switchTo(agent.id, account, when),
       });
       return {
-        kind: "item", id: account.id, title: account.label, icon: selected ? "Check" : "UserRound",
-        disabled: selected || !account.usable || account.status === "signed-out",
-        behavior: agent.running ? { kind: "menu", items: [
-          { kind: "item", id: "now", title: messages.message("now"), behavior: action("now") },
-          { kind: "item", id: "after", title: messages.message("after"), behavior: action("after-turn") },
-        ] } : action("now"),
+        kind: "item",
+        id: account.id,
+        title: account.email && !(account.kind === "profile" && account.status === "signed-out")
+          ? `${nameOf(account.label)} · ${account.email}`
+          : nameOf(account.label),
+        icon: selected ? "Check" : unavailable ? "UserX" : "UserRound",
+        disabled: selected || unavailable,
+        behavior: agent.running
+          ? {
+              kind: "menu",
+              items: [
+                { kind: "item", id: "now", title: messages.message("now"), icon: "Zap", behavior: action("now") },
+                { kind: "item", id: "after", title: messages.message("after"), icon: "Clock", behavior: action("after-turn") },
+              ],
+            }
+          : action("now"),
       };
     });
     if (choices.length) choices.push({ kind: "separator", id: "separator" });
-    choices.push({ kind: "item", id: "manage", title: messages.message("manage"), icon: "UsersRound",
-      behavior: { kind: "action", onPress: () => client.openScreen({ screenId: "accounts" }) } });
+    choices.push({
+      kind: "item",
+      id: "manage",
+      title: messages.message("manage"),
+      icon: "Settings2",
+      behavior: { kind: "action", onPress: () => client.openScreen({ screenId: "accounts" }) },
+    });
     const button: PluginButton<PluginText> = {
-      icon: "UserRound", title: messages.message("pill"),
-      label: accounts?.accounts.find(a => a.id === agent.account)?.label ?? agent.account,
+      icon: healthy ? "UserRound" : "UserX",
+      title: healthy ? messages.message("pill") : messages.message("pillSignedOut"),
+      label: current ? nameOf(current.label) : agent.account,
       behavior: { kind: "menu", items: choices },
     };
-    const pill = pills.get(agent.id);
+    const pill = accountPills.get(agent.id);
     if (pill) pill.update(button);
-    else pills.set(agent.id, client.addComposerPill({ id: "account", agentId: agent.id, workspaceId: agent.workspace, button }));
+    else {
+      accountPills.set(
+        agent.id,
+        client.addComposerPill({ id: "account", agentId: agent.id, workspaceId: agent.workspace, button }),
+      );
+    }
   }
+
+  // ---- Context pill -------------------------------------------------------------------------
+
+  function contextLabel(usage: ContextUsage | null | undefined): PluginText {
+    if (!usage) return messages.message("context.labelEmpty");
+    if (!usage.size) return messages.message("context.labelNoSize", { used: tokens(usage.used) });
+    return messages.message("context.label", {
+      used: tokens(usage.used),
+      size: tokens(usage.size),
+      pct: percent(usage.used / usage.size, client.i18n.locale),
+    });
+  }
+
+  function renderContextPill(agent: Member) {
+    if (!agent.workspace || nativeContext.has(agent.id)) {
+      contextPills.get(agent.id)?.remove();
+      contextPills.delete(agent.id);
+      return;
+    }
+    const button: PluginButton<PluginText> = {
+      icon: "Gauge",
+      title: messages.message("context.title"),
+      label: contextLabel(contextStore.get(agent.id)),
+      behavior: { kind: "popover", Content: ContextPopover },
+    };
+    const pill = contextPills.get(agent.id);
+    if (pill) pill.update({ label: button.label });
+    else {
+      contextPills.set(
+        agent.id,
+        client.addComposerPill({ id: "context", agentId: agent.id, workspaceId: agent.workspace, button }),
+      );
+    }
+  }
+
+  let polling = false;
+  async function pollContext() {
+    const ids = [...agents.values()].filter((agent) => agent.workspace).map((agent) => agent.id);
+    if (polling || lifetime.signal.aborted || ids.length === 0) return;
+    polling = true;
+    try {
+      const { usage, native } = await client.rpc(contextUsageRpc, { agentIds: ids });
+      nativeContext.clear();
+      for (const id of native) nativeContext.add(id);
+      for (const id of ids) contextStore.set(id, usage[id] ?? null);
+      for (const id of ids) {
+        const agent = agents.get(id);
+        if (agent) renderContextPill(agent);
+      }
+    } catch (error) {
+      if (!lifetime.signal.aborted) console.warn("[antigravity-accounts] context refresh failed", error);
+    } finally {
+      polling = false;
+    }
+  }
+  let soon: Timer | undefined;
+  function pollSoon() {
+    clearTimeout(soon);
+    soon = setTimeout(() => void pollContext(), 800);
+  }
+  const contextTimer = setInterval(() => void pollContext(), CONTEXT_POLL_MS);
+
+  // ---- Accounts -----------------------------------------------------------------------------
+
   function applyAccounts(next: AccountsState) {
-    if (lifetime.signal.aborted || (accounts && accounts.revision >= next.revision)) return;
+    if (lifetime.signal.aborted || (accounts && accounts.revision > next.revision)) return;
     accounts = next;
-    agents.forEach(renderPill);
+    agents.forEach(renderAccountPill);
   }
   let retry: Timer | undefined;
   async function readAccounts() {
-    try { applyAccounts(await client.rpc(listAccountsRpc, {})); }
-    catch (error) {
+    try {
+      applyAccounts(await client.rpc(listAccountsRpc, {}));
+    } catch (error) {
       if (lifetime.signal.aborted) return;
-      console.warn("Account list unavailable", error);
+      console.warn("[antigravity-accounts] account list unavailable", error);
       clearTimeout(retry);
       retry = setTimeout(readAccounts, 5000);
     }
   }
-  const watch = client.subscribe(watchAccountsSubscription, {}, ({ revision }) => {
-    if (revision > (accounts?.revision ?? -1)) void readAccounts();
-  }, { signal: lifetime.signal });
-  void watch.ready.catch(error => { if (!lifetime.signal.aborted) console.warn("Account watch unavailable", error); });
+  const watch = client.subscribe(
+    watchAccountsSubscription,
+    {},
+    ({ revision }) => {
+      if (revision > (accounts?.revision ?? -1)) void readAccounts();
+    },
+    { signal: lifetime.signal },
+  );
+  void watch.ready.catch((error: unknown) => {
+    if (!lifetime.signal.aborted) console.warn("[antigravity-accounts] account watch unavailable", error);
+  });
   void readAccounts();
+
+  // ---- Agents -------------------------------------------------------------------------------
 
   function publishCounts() {
     const next = new Map<string, number>();
     for (const { account } of agents.values()) next.set(account, (next.get(account) ?? 0) + 1);
-    if (counts && counts.size === next.size && [...next].every(([id,n]) => counts?.get(id) === n)) return;
+    if (counts && counts.size === next.size && [...next].every(([id, n]) => counts?.get(id) === n)) return;
     counts = next;
-    listeners.forEach(listener => listener());
+    listeners.forEach((listener) => listener());
   }
   function remove(id: string) {
-    pills.get(id)?.remove();
-    pills.delete(id);
+    accountPills.get(id)?.remove();
+    accountPills.delete(id);
+    contextPills.get(id)?.remove();
+    contextPills.delete(id);
+    contextStore.delete(id);
     agents.delete(id);
   }
   function upsert(row: AgentRow) {
     if (row.archivedAt || !isAntigravityProvider(row.provider)) return remove(row.id);
-    const member = { id: row.id, workspace: row.workspaceId ?? null,
-      account: accountIdFromMetadata(row.metadata), running: row.status === "running" };
+    const member: Member = {
+      id: row.id,
+      workspace: row.workspaceId ?? null,
+      account: accountIdFromMetadata(row.metadata),
+      running: row.status === "running" || row.status === "initializing",
+    };
     const old = agents.get(row.id);
+    // A status change usually means a turn started or ended: context changes then.
+    if (!old || old.running !== member.running) pollSoon();
     if (old && old.workspace === member.workspace && old.account === member.account && old.running === member.running) return;
     if (old && old.workspace !== member.workspace) remove(row.id);
     agents.set(row.id, member);
-    renderPill(member);
+    renderAccountPill(member);
+    renderContextPill(member);
   }
   let reconnect: Timer | undefined;
   async function observe() {
@@ -141,13 +283,19 @@ export function observeAgents(client: PluginClientContext) {
       });
     } catch (error) {
       if (lifetime.signal.aborted) return;
-      console.warn("Agent observation unavailable", error);
+      console.warn("[antigravity-accounts] agent observation unavailable", error);
       reconnect = setTimeout(observe, 5000);
     }
   }
   void observe();
+
+  // ---- /account -----------------------------------------------------------------------------
+
   const slash = client.addSlashCommand({
-    name: "account", context: "agent", description: messages.message("slash"), argumentHint: messages.message("hint"),
+    name: "account",
+    context: "agent",
+    description: messages.message("slash"),
+    argumentHint: messages.message("hint"),
     async onSubmit({ agent, args }) {
       if (!isAntigravityProvider(agent.provider)) return notify(client.i18n.t(messages, "only"));
       const state = await client.rpc(listAccountsRpc, {});
@@ -155,38 +303,55 @@ export function observeAgents(client: PluginClientContext) {
       const list = state.accounts;
       const current = accountIdFromMetadata(agent.metadata);
       const input = args.trim().toLowerCase();
-      if (!input) return notify(client.i18n.t(messages, "choices", {
-        label: list.find(a => a.id === current)?.label ?? current,
-        list: list.map((a, i) => `${i + 1}. ${a.label}`).join("\n"),
-      }));
-      let matches = list.filter(a => a.label.toLowerCase() === input);
-      if (/^\d+$/.test(input)) matches = list.slice(Number(input) - 1, Number(input));
-      else if (!matches.length) matches = list.filter(a => a.label.toLowerCase().startsWith(input));
-      if (matches.length !== 1) return notify(client.i18n.t(messages, matches.length ? "ambiguous" : "noMatch"));
-      if (!matches[0].usable || matches[0].status === "signed-out") {
-        return notify(matches[0].statusDetail || client.i18n.t(messages, "unusable"));
+      if (!input) {
+        return notify(
+          client.i18n.t(messages, "choices", {
+            label: nameOf(list.find((account) => account.id === current)?.label ?? current),
+            list: list.map((account, index) => `${index + 1}. ${nameOf(account.label)}`).join("\n"),
+          }),
+        );
       }
-      await switchTo(agent.id, matches[0], agent.status === "running" ? "after-turn" : "now");
+      const named = (account: AccountSummary) => nameOf(account.label).toLowerCase();
+      let matches = list.filter((account) => named(account) === input || account.label.toLowerCase() === input);
+      if (/^\d+$/.test(input)) matches = list.slice(Number(input) - 1, Number(input));
+      else if (!matches.length) matches = list.filter((account) => named(account).startsWith(input));
+      if (matches.length !== 1) return notify(client.i18n.t(messages, matches.length ? "ambiguous" : "noMatch"));
+      const target = matches[0]!;
+      if (!target.usable || target.status === "signed-out") {
+        return notify(target.statusDetail || client.i18n.t(messages, "unusable"));
+      }
+      await switchTo(agent.id, target, agent.status === "running" ? "after-turn" : "now");
     },
   });
+
   return {
     useNotifications,
     counts: () => counts,
-    subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    refreshContext: () => pollContext(),
     stop() {
       lifetime.abort();
       clearTimeout(retry);
       clearTimeout(reconnect);
+      clearTimeout(soon);
+      clearInterval(contextTimer);
       slash();
-      pills.forEach(pill => pill.remove());
-      pills.clear();
+      accountPills.forEach((pill) => pill.remove());
+      contextPills.forEach((pill) => pill.remove());
+      accountPills.clear();
+      contextPills.clear();
       agents.clear();
       listeners.clear();
       presenters.clear();
+      contextStore.clear();
       pendingNotice = undefined;
     },
   };
 }
 
-type ObserveAgents = typeof observeAgents;
-export type AgentObservation = ReturnType<ObserveAgents>;
+export type AgentObservation = ReturnType<typeof observeAgents>;

@@ -1,17 +1,66 @@
 import type { RpcOutput } from "@getpaseo/plugin";
-import { useRpc, useTranslation } from "@getpaseo/plugin/client";
-import { copyText, ExternalLink, Modal, TextInput, useToast } from "@getpaseo/plugin/client/ui";
-import { useEffect, useRef, useState } from "react";
-import { Text, View } from "react-native";
+import { openExternalUrl, useRpc, useTranslation } from "@getpaseo/plugin/client";
+import { copyText, Modal, TextInput, useToast } from "@getpaseo/plugin/client/ui";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { ActivityIndicator, Text, View } from "react-native";
 import { cancelSignInRpc, startSignInRpc, submitSignInRpc, type AccountSummary, type AccountsState } from "../shared/contracts";
-import { actions, Button, fieldStyle, type Colors } from "./controls";
+import { relative } from "./format";
 import { errorMessage, messages } from "./messages";
+import { font, mono, radius, space, tint, type Colors } from "./theme";
+import { Button, Callout, Muted } from "./ui";
 
-type StartSignIn = typeof startSignInRpc;
-type Session = RpcOutput<StartSignIn>;
+type Session = RpcOutput<typeof startSignInRpc>;
 
-export function SignIn({ account, colors, accept, close }: {
-  account: AccountSummary; colors: Colors; accept(state: AccountsState): void; close(): void;
+function Step({
+  colors,
+  number,
+  title,
+  body,
+  done = false,
+  children,
+}: {
+  colors: Colors;
+  number: number;
+  title: string;
+  body: string;
+  done?: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <View style={{ flexDirection: "row", gap: space.md }}>
+      <View
+        style={{
+          width: 26,
+          height: 26,
+          borderRadius: 13,
+          alignItems: "center",
+          justifyContent: "center",
+          backgroundColor: done ? colors.accent : tint(colors.accent, 0.15),
+        }}
+      >
+        <Text style={{ ...font.small, fontWeight: "700", color: done ? colors.accentForeground : colors.accent }}>{number}</Text>
+      </View>
+      <View style={{ flex: 1, gap: space.sm }}>
+        <View style={{ gap: 2 }}>
+          <Text style={{ ...font.heading, color: colors.foreground }}>{title}</Text>
+          <Muted colors={colors}>{body}</Muted>
+        </View>
+        {children}
+      </View>
+    </View>
+  );
+}
+
+export function SignIn({
+  account,
+  colors,
+  accept,
+  close,
+}: {
+  account: AccountSummary;
+  colors: Colors;
+  accept(state: AccountsState): void;
+  close(): void;
 }) {
   const start = useRpc(startSignInRpc);
   const submit = useRpc(submitSignInRpc);
@@ -22,81 +71,165 @@ export function SignIn({ account, colors, accept, close }: {
   const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [opened, setOpened] = useState(false);
   const [attempt, setAttempt] = useState(0);
-  const active = useRef(false);
-  const login = useRef<Session["loginId"] | null>(null);
-  const submitting = useRef(false);
-  const closing = useRef(false);
+  const [now, setNow] = useState(Date.now);
+  const active = useRef(true);
+  const login = useRef<string | null>(null);
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(timer);
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     active.current = true;
     setError("");
     setSession(null);
-    void start({ accountId: account.id }).then(result => {
-      if (disposed) return cancel({ loginId: result.loginId }).then(() => {});
-      login.current = result.loginId;
-      setSession(result);
-    }).catch(reason => { if (!disposed) setError(errorMessage(reason)); });
+    setOpened(false);
+    void start({ accountId: account.id })
+      .then((result) => {
+        if (disposed) return cancel({ loginId: result.loginId }).then(() => undefined);
+        login.current = result.loginId;
+        setSession(result);
+        return undefined;
+      })
+      .catch((reason: unknown) => {
+        if (!disposed) setError(errorMessage(reason));
+      });
     return () => {
       disposed = true;
       active.current = false;
       const loginId = login.current;
       login.current = null;
-      if (loginId) void cancel({ loginId }).catch(() => {});
+      if (loginId) void cancel({ loginId }).catch(() => undefined);
     };
   }, [account.id, attempt, start, cancel]);
 
-  async function dismiss() {
-    if (closing.current) return;
-    closing.current = true;
-    try {
-      if (login.current) await cancel({ loginId: login.current });
-      login.current = null;
-      if (active.current) close();
-    } catch (reason) {
-      closing.current = false;
-      if (active.current) setError(errorMessage(reason));
-    }
-  }
+  const expired = session ? Date.parse(session.expiresAt) <= now : false;
+
   async function finish() {
-    if (!login.current || closing.current || submitting.current) return;
-    submitting.current = true;
+    if (!login.current || busy || !code.trim()) return;
     setBusy(true);
     setError("");
     try {
       const state = await submit({ loginId: login.current, code: code.trim() });
       login.current = null;
       accept(state);
-      if (active.current && !closing.current) {
-        toast.show(t("signedIn", { label: account.label }), { variant: "success" });
+      if (active.current) {
+        toast.show(t("signin.done", { label: account.label }), { variant: "success" });
         close();
       }
     } catch (reason) {
-      if (active.current && !closing.current) setError(errorMessage(reason));
+      if (active.current) {
+        setError(errorMessage(reason));
+        // agy exits after a rejected code; the next try needs a fresh link.
+        login.current = null;
+      }
     } finally {
-      submitting.current = false;
       if (active.current) setBusy(false);
     }
   }
-  return <Modal open title={t("loginTitle", { label: account.label })} onOpenChange={open => { if (!open) void dismiss(); }}>
-    <Modal.Content>
-      {session ? <>
-        <ExternalLink href={session.url} onError={reason => setError(errorMessage(reason))}>{t("open")}</ExternalLink>
-        <Button colors={colors} label={t("copy")} onPress={() => {
-          void copyText(session.url).then(() => toast.show(t("copied"))).catch(reason => setError(errorMessage(reason)));
-        }} />
-        <Text style={{ color: colors.foregroundMuted }}>{t("expires", { time: new Date(session.expiresAt).toLocaleString(locale) })}</Text>
-        <Text style={{ color: colors.foreground }}>{t("code")}</Text>
-        <TextInput accessibilityLabel={t("code")} autoCapitalize="none" autoCorrect={false} maxLength={16384}
-          editable={!busy} value={code} onChangeText={setCode} style={fieldStyle(colors)} />
-      </> : !error && <Text style={{ color: colors.foregroundMuted }}>{t("working")}</Text>}
-      {busy && <Text accessibilityLiveRegion="polite" style={{ color: colors.foreground }}>{t("waiting")}</Text>}
-      {!!error && <Text selectable style={{ color: colors.statusDanger }}>{error}</Text>}
-      <View style={actions}>
-        {session && <Button label={t("submit")} colors={colors} disabled={busy || !code.trim()} onPress={finish} />}
-        {!!error && !busy && <Button label={t("again")} colors={colors} onPress={() => { setCode(""); setAttempt(n => n + 1); }} />}
-        <Button label={t("cancel")} colors={colors} onPress={dismiss} />
-      </View>
-    </Modal.Content>
-  </Modal>;
+
+  function restart() {
+    setCode("");
+    setAttempt((value) => value + 1);
+  }
+
+  return (
+    <Modal open title={t("signin.title", { label: account.label })} onOpenChange={(open) => { if (!open && !busy) close(); }}>
+      <Modal.Content>
+        {!session && !error ? (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.lg }}>
+            <ActivityIndicator color={colors.accent} />
+            <Muted colors={colors}>{t("signin.preparing")}</Muted>
+          </View>
+        ) : null}
+
+        {session ? (
+          <View style={{ gap: space.xl }}>
+            <Step colors={colors} number={1} done={opened} title={t("signin.step1Title")} body={t("signin.step1Body")}>
+              <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
+                <Button
+                  colors={colors}
+                  variant={opened ? "secondary" : "primary"}
+                  icon="ExternalLink"
+                  label={t("signin.open")}
+                  disabled={expired}
+                  onPress={() => {
+                    setOpened(true);
+                    void openExternalUrl(session.url).catch((reason: unknown) => setError(errorMessage(reason)));
+                  }}
+                />
+                <Button
+                  colors={colors}
+                  variant="ghost"
+                  icon="Copy"
+                  label={t("signin.copy")}
+                  disabled={expired}
+                  onPress={() => {
+                    void copyText(session.url)
+                      .then(() => toast.show(t("signin.copied")))
+                      .catch((reason: unknown) => setError(errorMessage(reason)));
+                  }}
+                />
+              </View>
+            </Step>
+            <Step colors={colors} number={2} title={t("signin.step2Title")} body={t("signin.step2Body")}>
+              <TextInput
+                accessibilityLabel={t("signin.step2Title")}
+                autoCapitalize="none"
+                autoCorrect={false}
+                spellCheck={false}
+                maxLength={16384}
+                editable={!busy && !expired}
+                value={code}
+                onChangeText={setCode}
+                onSubmitEditing={() => void finish()}
+                placeholder={t("signin.placeholder")}
+                placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
+                style={{
+                  fontFamily: mono,
+                  fontSize: 13,
+                  color: colors.foreground,
+                  backgroundColor: colors.surface0,
+                  borderColor: colors.border,
+                  borderWidth: 1,
+                  borderRadius: radius.md,
+                  paddingHorizontal: space.md,
+                  paddingVertical: space.sm + 2,
+                }}
+              />
+            </Step>
+            <Muted colors={colors} small>
+              {expired ? t("signin.expired") : t("signin.expires", { time: relative(session.expiresAt, now, locale) })}
+            </Muted>
+          </View>
+        ) : null}
+
+        {error ? (
+          <Callout colors={colors} tone="danger" icon="CircleAlert" title={error} />
+        ) : null}
+
+        <View style={{ flexDirection: "row", justifyContent: "flex-end", flexWrap: "wrap", gap: space.sm, marginTop: space.sm }}>
+          <Button colors={colors} variant="ghost" label={t("dialog.cancel")} disabled={busy} onPress={close} />
+          {error || expired ? (
+            <Button colors={colors} variant="secondary" icon="RotateCcw" label={t("signin.restart")} disabled={busy} onPress={restart} />
+          ) : null}
+          {session && !expired && login.current ? (
+            <Button
+              colors={colors}
+              variant="primary"
+              icon={busy ? undefined : "Check"}
+              label={busy ? t("signin.waiting") : t("signin.submit")}
+              loading={busy}
+              disabled={!code.trim()}
+              onPress={() => void finish()}
+            />
+          ) : null}
+        </View>
+      </Modal.Content>
+    </Modal>
+  );
 }

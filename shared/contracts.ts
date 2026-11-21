@@ -217,3 +217,34 @@ export const watchAccountsSubscription = defineSubscription({
   input: empty,
   event: z.object({ revision: z.number().int().nonnegative() }),
 });
+
+export const contextUsageSchema = z.object({
+  /** Tokens in the context window after the latest model call (new input + cache reads + output). */
+  used: z.number().int().nonnegative(),
+  /** Context window size; null when neither agy nor the model name tells it. */
+  size: z.number().int().positive().nullable(),
+  input: z.number().int().nonnegative(),
+  cached: z.number().int().nonnegative(),
+  output: z.number().int().nonnegative(),
+  /** "agy": the window agy recorded for the call. "model": inferred from the model name. */
+  sizeSource: z.enum(["agy", "model"]).nullable(),
+  /** ISO time of the latest model call's record. */
+  updatedAt: z.string().nullable(),
+  model: z.string().nullable(),
+});
+
+export type ContextUsage = z.infer<typeof contextUsageSchema>;
+
+/**
+ * Context window usage of Antigravity agents, read from agy's own conversation records.
+ * `native` lists agents whose provider already reports context usage to Paseo (newer Paseo
+ * versions), so the client can leave those to Paseo's built-in meter.
+ */
+export const contextUsageRpc = defineRpc({
+  name: "context.usage",
+  input: z.object({ agentIds: z.array(z.string().min(1)).max(200) }).strict(),
+  output: z.object({
+    usage: z.record(z.string(), contextUsageSchema.nullable()),
+    native: z.array(z.string()),
+  }),
+});
