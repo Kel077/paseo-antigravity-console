@@ -22,7 +22,7 @@ function Step({
   colors: Colors;
   number: number;
   title: string;
-  body: string;
+  body?: string;
   done?: boolean;
   children?: ReactNode;
 }) {
@@ -43,7 +43,7 @@ function Step({
       <View style={{ flex: 1, gap: space.sm }}>
         <View style={{ gap: 2 }}>
           <Text style={{ ...font.heading, color: colors.foreground }}>{title}</Text>
-          <Muted colors={colors}>{body}</Muted>
+          {body ? <Muted colors={colors}>{body}</Muted> : null}
         </View>
         {children}
       </View>
@@ -149,7 +149,7 @@ export function SignIn({
 
         {session ? (
           <View style={{ gap: space.xl }}>
-            <Step colors={colors} number={1} done={opened} title={t("signin.step1Title")} body={t("signin.step1Body")}>
+            <Step colors={colors} number={1} done={opened} title={t("signin.step1Title")}>
               <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.sm }}>
                 <Button
                   colors={colors}
@@ -176,7 +176,7 @@ export function SignIn({
                 />
               </View>
             </Step>
-            <Step colors={colors} number={2} title={t("signin.step2Title")} body={t("signin.step2Body")}>
+            <Step colors={colors} number={2} title={t("signin.step2Title")}>
               <TextInput
                 accessibilityLabel={t("signin.step2Title")}
                 autoCapitalize="none"

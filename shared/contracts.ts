@@ -248,3 +248,41 @@ export const contextUsageRpc = defineRpc({
     native: z.array(z.string()),
   }),
 });
+
+export const statsRangeSchema = z.enum(["24h", "7d", "30d"]);
+export type StatsRange = z.infer<typeof statsRangeSchema>;
+
+/** Token and timing sums for a set of model calls; ratios are derived by the client. */
+export const usageTotalsSchema = z.object({
+  requests: z.number().int().nonnegative(),
+  input: z.number().nonnegative(),
+  cached: z.number().nonnegative(),
+  output: z.number().nonnegative(),
+  /** Seconds spent streaming output (TPS = output / generationSeconds). */
+  generationSeconds: z.number().nonnegative(),
+  /** Seconds from request to first token, summed. */
+  firstTokenSeconds: z.number().nonnegative(),
+});
+
+export type UsageTotals = z.infer<typeof usageTotalsSchema>;
+
+export const usageStatsSchema = z.object({
+  range: statsRangeSchema,
+  /** Start of each bin in ms since epoch; bins are contiguous and the last one contains "now". */
+  binMs: z.number().int().positive(),
+  bins: z.array(usageTotalsSchema.extend({ start: z.number() })),
+  totals: usageTotalsSchema,
+  /** Per model label as agy shows it, most requests first. */
+  models: z.array(usageTotalsSchema.extend({ label: z.string() })),
+  conversations: z.number().int().nonnegative(),
+  generatedAt: z.string(),
+});
+
+export type UsageStats = z.infer<typeof usageStatsSchema>;
+
+/** Usage of every Antigravity conversation on this host (all accounts share the store). */
+export const usageStatsRpc = defineRpc({
+  name: "stats.usage",
+  input: z.object({ range: statsRangeSchema }).strict(),
+  output: usageStatsSchema,
+});

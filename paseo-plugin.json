@@ -4,6 +4,6 @@
   "requirements": {
     "paseo": ">=0.16.2"
   },
-  "name": "Antigravity Accounts",
-  "description": "Use several Google accounts with the built-in Antigravity provider and switch an agent between them without losing its conversation."
+  "name": "Antigravity Console",
+  "description": "Usage, quota and multiple Google accounts for the built-in Antigravity provider, with per-agent account switching that keeps the conversation."
 }

@@ -54,7 +54,8 @@ export function Button({
       onPress={onPress}
       style={(state) => ({
         height,
-        paddingHorizontal: size === "sm" ? space.md : space.lg,
+        paddingHorizontal: label ? (size === "sm" ? space.md : space.lg) : 0,
+        width: label ? undefined : height,
         borderRadius: radius.md,
         flexDirection: "row",
         alignItems: "center",
@@ -71,9 +72,11 @@ export function Button({
       ) : icon ? (
         <Icon name={icon} size={size === "sm" ? 14 : 16} color={foreground} />
       ) : null}
-      <Text numberOfLines={1} style={{ ...(size === "sm" ? font.small : font.body), color: foreground, fontWeight: "500" }}>
-        {label}
-      </Text>
+      {label ? (
+        <Text numberOfLines={1} style={{ ...(size === "sm" ? font.small : font.body), color: foreground, fontWeight: "500" }}>
+          {label}
+        </Text>
+      ) : null}
     </Pressable>
   );
 }
@@ -228,9 +231,12 @@ export function Avatar({
 
 export function Bar({ colors, fraction, tone, height = 6 }: { colors: Colors; fraction: number; tone: Tone; height?: number }) {
   const width = `${Math.max(0, Math.min(1, fraction)) * 100}%` as const;
+  const fill = toneColor(colors, tone);
+  // The track is a light step of the fill's own color, so the state reads across the whole bar.
+  const track = tone === "neutral" ? tint(colors.foreground, 0.08) : tint(fill, 0.16);
   return (
-    <View style={{ height, borderRadius: height / 2, backgroundColor: tint(colors.foreground, 0.08), overflow: "hidden" }}>
-      <View style={{ height, width, borderRadius: height / 2, backgroundColor: toneColor(colors, tone) }} />
+    <View style={{ height, borderRadius: height / 2, backgroundColor: track, overflow: "hidden" }}>
+      <View style={{ height, width, borderRadius: height / 2, backgroundColor: fill }} />
     </View>
   );
 }

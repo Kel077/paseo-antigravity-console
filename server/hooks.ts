@@ -155,6 +155,27 @@ export function registerHooks(
     }),
   );
 
+  // A finished turn used quota: re-read that account's quota shortly after, once per burst.
+  const quotaRefresh = new Map<string, NodeJS.Timeout>();
+  removers.push(
+    server.addHook("agent.turn.after", async ({ agent }) => {
+      if (!isAntigravityProvider(agent.provider)) return;
+      const accountId = accountIdFromMetadata(agent.metadata);
+      clearTimeout(quotaRefresh.get(accountId));
+      quotaRefresh.set(
+        accountId,
+        setTimeout(() => {
+          quotaRefresh.delete(accountId);
+          void service.refreshOne(accountId).catch(() => undefined);
+        }, 15_000),
+      );
+    }),
+  );
+  removers.push(() => {
+    for (const timer of quotaRefresh.values()) clearTimeout(timer);
+    quotaRefresh.clear();
+  });
+
   // Deferred switches run as soon as the agent's turn ends.
   removers.push(
     server.addHook("agent.turn.after", async ({ agent }, { paseo }) => {

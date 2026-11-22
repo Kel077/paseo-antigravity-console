@@ -231,7 +231,7 @@ export function AccountCard({
               ) : undefined
             }
           >
-            <Muted colors={colors}>{isProfile ? t("callout.signedOutBody") : t("callout.systemSignedOutBody")}</Muted>
+            {isProfile ? null : <Muted colors={colors}>{t("callout.systemSignedOutBody")}</Muted>}
           </Callout>
         ) : account.status === "error" ? (
           <Callout colors={colors} tone="danger" icon="CircleAlert" title={t("callout.errorTitle")}>

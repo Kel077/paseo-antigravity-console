@@ -5,7 +5,11 @@ import {
   type QuotaGroup,
 } from "../shared/contracts";
 import { agyVersion, probeAccount, readAccountEmail } from "./agy";
-import { resolveAgy } from "./paths";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { dataDir, resolveAgy } from "./paths";
+
+const statusFile = () => path.join(dataDir(), "status.json");
 import { deleteSignIn, ensureProfile, removeProfile, scanAfterSignIn } from "./profile";
 import { SignInManager } from "./signin";
 import { AccountStore, type StoredAccount } from "./store";
@@ -32,8 +36,38 @@ export class AccountService {
   private agyVersionValue: string | null = null;
   private agyChecked = false;
 
-  async init(): Promise<void> {
-    await this.store.load();
+  private initialized: Promise<void> | null = null;
+  private saveTimer: NodeJS.Timeout | null = null;
+
+  /** Loads the account list and the last known statuses, so a restart shows quota at once. */
+  init(): Promise<void> {
+    this.initialized ??= (async () => {
+      await this.store.load();
+      try {
+        const raw = JSON.parse(await fs.readFile(statusFile(), "utf8")) as Record<string, RuntimeStatus>;
+        for (const [id, status] of Object.entries(raw)) {
+          if (id === SYSTEM_ACCOUNT_ID || this.store.get(id)) this.runtime.set(id, status);
+        }
+      } catch {
+        // No cache yet.
+      }
+    })();
+    return this.initialized;
+  }
+
+  private saveStatuses(): void {
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      const file = statusFile();
+      const temp = `${file}.${process.pid}.tmp`;
+      const body = JSON.stringify(Object.fromEntries(this.runtime), null, 1);
+      void fs
+        .mkdir(path.dirname(file), { recursive: true })
+        .then(() => fs.writeFile(temp, body, { mode: 0o600 }))
+        .then(() => fs.rename(temp, file))
+        .catch((error: unknown) => console.error("antigravity-accounts: could not save statuses", error));
+    }, 1000);
   }
 
   onChange(listener: (revision: number) => void): () => void {
@@ -47,6 +81,7 @@ export class AccountService {
 
   private changed(): void {
     this.revision += 1;
+    this.saveStatuses();
     for (const listener of this.listeners) {
       try {
         listener(this.revision);
@@ -348,6 +383,7 @@ export class AccountService {
   }
 
   dispose(): void {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
     this.signIns.cancelAll();
     this.listeners.clear();
   }

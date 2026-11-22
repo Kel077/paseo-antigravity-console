@@ -1,7 +1,7 @@
 import { useRpc, useTranslation, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SettingsCard, SettingsRow, SettingsSelect, useToast } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Text, View } from "react-native";
 import {
   createAccountRpc,
   refreshAccountsRpc,
@@ -15,11 +15,12 @@ import { AccountCard, type CardAction } from "./AccountCard";
 import type { AgentObservation } from "./agents";
 import { ConfirmRemove, NameDialog } from "./dialogs";
 import { displayLabel } from "./labels";
+import { antigravityLogo } from "./logo";
 import { errorMessage, messages } from "./messages";
 import { SignIn } from "./signIn";
+import { UsageSection } from "./stats";
 import { font, radius, space, tint, type Colors } from "./theme";
-import { antigravityLogo } from "./logo";
-import { Avatar, Button, Callout, Card, Muted } from "./ui";
+import { Avatar, Button, Callout, Muted } from "./ui";
 import { useAccounts } from "./useAccounts";
 
 type Dialog =
@@ -28,82 +29,46 @@ type Dialog =
   | { kind: "remove"; account: AccountSummary }
   | { kind: "signIn"; account: AccountSummary };
 
-function EmptyState({ colors, onAdd }: { colors: Colors; onAdd(): void }) {
+function SectionTitle({ colors, title, count }: { colors: Colors; title: string; count?: number }) {
+  return (
+    <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
+      <Text style={{ ...font.heading, color: colors.foreground }}>{title}</Text>
+      {count !== undefined ? <Text style={{ ...font.small, color: colors.foregroundMuted }}>{count}</Text> : null}
+    </View>
+  );
+}
+
+function AddAccountCard({ colors, onAdd }: { colors: Colors; onAdd(): void }) {
   const { t } = useTranslation(messages);
   return (
     <View
       style={{
+        flex: 1,
+        minHeight: 160,
         borderWidth: 1,
         borderStyle: "dashed",
         borderColor: colors.border,
         borderRadius: radius.lg,
-        padding: space.xxl,
+        padding: space.xl,
         alignItems: "center",
+        justifyContent: "center",
         gap: space.md,
       }}
     >
       <View
         style={{
-          width: 48,
-          height: 48,
-          borderRadius: 24,
+          width: 44,
+          height: 44,
+          borderRadius: 22,
           alignItems: "center",
           justifyContent: "center",
           backgroundColor: tint(colors.accent, 0.14),
         }}
       >
-        <Icon name="UserPlus" size={22} color={colors.accent} />
+        <Icon name="UserPlus" size={20} color={colors.accent} />
       </View>
       <Text style={{ ...font.heading, color: colors.foreground, textAlign: "center" }}>{t("empty.title")}</Text>
-      <Text style={{ ...font.small, color: colors.foregroundMuted, textAlign: "center", maxWidth: 440 }}>{t("empty.body")}</Text>
       <Button colors={colors} variant="primary" icon="Plus" label={t("add")} onPress={onAdd} />
-    </View>
-  );
-}
-
-function HowItWorks({ colors }: { colors: Colors }) {
-  const { t } = useTranslation(messages);
-  const [open, setOpen] = useState(false);
-  const points = [
-    { icon: "ArrowLeftRight", title: t("how.switchTitle"), body: t("how.switchBody") },
-    { icon: "ListFilter", title: t("how.modelsTitle"), body: t("how.modelsBody") },
-    { icon: "ShieldCheck", title: t("how.safetyTitle"), body: t("how.safetyBody") },
-  ];
-  return (
-    <View style={{ gap: space.md }}>
-      <Pressable
-        accessibilityRole="button"
-        accessibilityState={{ expanded: open }}
-        onPress={() => setOpen((value) => !value)}
-        style={{ flexDirection: "row", alignItems: "center", gap: space.sm, alignSelf: "flex-start", paddingVertical: space.xs }}
-      >
-        <Icon name={open ? "ChevronDown" : "ChevronRight"} size={16} color={colors.foregroundMuted} />
-        <Text style={{ ...font.small, fontWeight: "600", color: colors.foregroundMuted }}>{t("how.title")}</Text>
-      </Pressable>
-      {open ? (
-        <View style={{ gap: space.lg, paddingLeft: space.xs }}>
-          {points.map((point) => (
-            <View key={point.icon} style={{ flexDirection: "row", gap: space.md }}>
-              <View
-                style={{
-                  width: 30,
-                  height: 30,
-                  borderRadius: radius.md,
-                  alignItems: "center",
-                  justifyContent: "center",
-                  backgroundColor: tint(colors.foreground, 0.06),
-                }}
-              >
-                <Icon name={point.icon} size={15} color={colors.foreground} />
-              </View>
-              <View style={{ flex: 1, gap: 2 }}>
-                <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>{point.title}</Text>
-                <Muted colors={colors}>{point.body}</Muted>
-              </View>
-            </View>
-          ))}
-        </View>
-      ) : null}
     </View>
   );
 }
@@ -146,11 +111,17 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
     const input = { accountId: account.id };
     switch (action) {
       case "refresh":
-        return void track(account.id, action, async () => { accept(await refresh(input)); });
+        return void track(account.id, action, async () => {
+          accept(await refresh(input));
+        });
       case "makeDefault":
-        return void track(account.id, action, async () => { accept(await setDefault(input)); });
+        return void track(account.id, action, async () => {
+          accept(await setDefault(input));
+        });
       case "signOut":
-        return void track(account.id, action, async () => { accept(await signOut(input)); });
+        return void track(account.id, action, async () => {
+          accept(await signOut(input));
+        });
       case "rename":
         return setDialog({ kind: "rename", account });
       case "remove":
@@ -161,44 +132,43 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
   }
 
   const compact = layout.compact || (width > 0 && width < 560);
-  const columns = width >= 820 ? 2 : 1;
-  const gap = compact ? space.md : space.lg;
   const padding = compact ? space.lg : space.xxl;
+  const gap = compact ? space.md : space.lg;
   const contentWidth = Math.min(Math.max(width - padding * 2, 0), 980);
+  const columns = contentWidth >= 820 ? 2 : 1;
   const cardWidth = columns === 2 ? (contentWidth - gap) / 2 : contentWidth;
   const profiles = data?.accounts.filter((account) => account.kind === "profile") ?? [];
+  const fallback = data?.accounts.find((account) => account.id === data.defaultAccountId);
+  const defaultUnavailable =
+    fallback && fallback.kind === "profile" && (!fallback.usable || fallback.status === "signed-out");
+  // An odd number of cards leaves room for the add tile beside the last one.
+  const showAddTile = data !== undefined && (profiles.length === 0 || (columns === 2 && data.accounts.length % 2 === 1));
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.surface0 }} onLayout={(event) => setWidth(event.nativeEvent.layout.width)}>
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding, alignItems: "center" }}>
-        <View style={{ width: contentWidth || "100%", maxWidth: 980, gap: space.xxl }}>
-          <View style={{ flexDirection: compact ? "column" : "row", alignItems: compact ? "stretch" : "flex-end", gap: space.lg }}>
-            <View style={{ flex: compact ? undefined : 1, flexDirection: "row", alignItems: "center", gap: space.lg }}>
-              <Avatar colors={colors} label="A" logo={antigravityLogo} size={compact ? 44 : 52} />
-              <View style={{ flex: 1, gap: space.xs }}>
-                <Text accessibilityRole="header" style={{ ...font.title, color: colors.foreground }}>
-                  {t("title")}
-                </Text>
-                <Text style={{ ...font.body, color: colors.foregroundMuted }}>{t("subtitle")}</Text>
-              </View>
-            </View>
-            <View style={{ flexDirection: "row", gap: space.sm }}>
-              <Button
-                colors={colors}
-                variant="secondary"
-                icon="RefreshCw"
-                label={t("refreshAll")}
-                loading={refreshingAll}
-                onPress={() => {
-                  setRefreshingAll(true);
-                  void refresh({})
-                    .then(accept)
-                    .catch((reason: unknown) => toast.error(errorMessage(reason)))
-                    .finally(() => setRefreshingAll(false));
-                }}
-              />
-              <Button colors={colors} variant="primary" icon="Plus" label={t("add")} onPress={() => setDialog({ kind: "add" })} />
-            </View>
+        <View style={{ width: contentWidth || "100%", maxWidth: 980, gap: space.xxxl }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: space.lg }}>
+            <Avatar colors={colors} label="A" logo={antigravityLogo} size={compact ? 40 : 48} />
+            <Text accessibilityRole="header" numberOfLines={1} style={{ ...font.title, color: colors.foreground, flex: 1 }}>
+              {t("title")}
+            </Text>
+            <Button
+              colors={colors}
+              variant="secondary"
+              icon="RefreshCw"
+              label={compact ? "" : t("refreshAll")}
+              accessibilityLabel={t("refreshAll")}
+              loading={refreshingAll}
+              onPress={() => {
+                setRefreshingAll(true);
+                void refresh({})
+                  .then(accept)
+                  .catch((reason: unknown) => toast.error(errorMessage(reason)))
+                  .finally(() => setRefreshingAll(false));
+              }}
+            />
+            <Button colors={colors} variant="primary" icon="Plus" label={compact ? "" : t("add")} accessibilityLabel={t("add")} onPress={() => setDialog({ kind: "add" })} />
           </View>
 
           {error ? (
@@ -210,30 +180,57 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
               action={<Button colors={colors} size="sm" label={t("retry")} onPress={() => void refetch()} />}
             />
           ) : null}
+          {data && data.problems.length > 0 ? (
+            <Callout colors={colors} tone="warning" icon="TriangleAlert" title={t("hostProblems")}>
+              {data.problems.map((problem) => (
+                <Muted key={problem} colors={colors}>
+                  {problem}
+                </Muted>
+              ))}
+            </Callout>
+          ) : null}
+
+          {contentWidth > 0 ? <UsageSection colors={colors} width={contentWidth} compact={compact} /> : null}
 
           {!data && !error ? (
-            <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.xxl, alignSelf: "center" }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.xl, alignSelf: "center" }}>
               <ActivityIndicator color={colors.accent} />
               <Muted colors={colors}>{t("loading")}</Muted>
             </View>
           ) : null}
 
           {data ? (
-            <>
-              {data.problems.length > 0 ? (
-                <Callout colors={colors} tone="warning" icon="TriangleAlert" title={t("hostProblems")}>
-                  {data.problems.map((problem) => (
-                    <Muted key={problem} colors={colors}>
-                      {problem}
-                    </Muted>
-                  ))}
-                </Callout>
-              ) : null}
+            <View style={{ gap: space.md }}>
+              <SectionTitle colors={colors} title={t("accountsHeading")} count={data.accounts.length} />
+              <View style={{ flexDirection: "row", flexWrap: "wrap", gap }}>
+                {data.accounts.map((account, index) => (
+                  <View key={account.id} style={{ width: cardWidth || "100%", alignSelf: "stretch", zIndex: data.accounts.length - index }}>
+                    <AccountCard
+                      account={account}
+                      colors={colors}
+                      count={counts ? (counts.get(account.id) ?? 0) : undefined}
+                      now={now}
+                      busy={busy[account.id] ?? null}
+                      compact={compact}
+                      onAction={(action) => onAction(account, action)}
+                    />
+                  </View>
+                ))}
+                {showAddTile ? (
+                  <View style={{ width: cardWidth || "100%", alignSelf: "stretch" }}>
+                    <AddAccountCard colors={colors} onAdd={() => setDialog({ kind: "add" })} />
+                  </View>
+                ) : null}
+              </View>
+            </View>
+          ) : null}
 
+          {data ? (
+            <View style={{ gap: space.md }}>
+              <SectionTitle colors={colors} title={t("settingsHeading")} />
               <SettingsCard>
                 <SettingsSelect
                   label={t("overview.default")}
-                  hint={t("overview.defaultHint")}
                   value={data.defaultAccountId}
                   options={data.accounts.filter((account) => account.usable).map((account) => ({ value: account.id, label: displayLabel(account.label, t) }))}
                   onValueChange={(accountId) => {
@@ -248,44 +245,10 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
                   </Text>
                 </SettingsRow>
               </SettingsCard>
-
-              {(() => {
-                const fallback = data.accounts.find((account) => account.id === data.defaultAccountId);
-                if (!fallback || fallback.kind === "system" || (fallback.usable && fallback.status !== "signed-out")) return null;
-                return (
-                  <Callout colors={colors} tone="warning" icon="TriangleAlert" title={t("overview.defaultUnavailable", { label: displayLabel(fallback.label, t) })}>
-                    <Muted colors={colors}>{t("overview.defaultUnavailableBody")}</Muted>
-                  </Callout>
-                );
-              })()}
-
-              <View style={{ gap: space.md }}>
-                <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
-                  <Text style={{ ...font.heading, color: colors.foreground }}>{t("accountsHeading")}</Text>
-                  <Text style={{ ...font.small, color: colors.foregroundMuted }}>{data.accounts.length}</Text>
-                </View>
-                <View style={{ flexDirection: "row", flexWrap: "wrap", gap }}>
-                  {data.accounts.map((account, index) => (
-                    <View key={account.id} style={{ width: cardWidth || "100%", alignSelf: "stretch", zIndex: data.accounts.length - index }}>
-                      <AccountCard
-                        account={account}
-                        colors={colors}
-                        count={counts ? (counts.get(account.id) ?? 0) : undefined}
-                        now={now}
-                        busy={busy[account.id] ?? null}
-                        compact={compact}
-                        onAction={(action) => onAction(account, action)}
-                      />
-                    </View>
-                  ))}
-                </View>
-                {profiles.length === 0 ? <EmptyState colors={colors} onAdd={() => setDialog({ kind: "add" })} /> : null}
-              </View>
-
-              <Card colors={colors} style={{ padding: space.lg, backgroundColor: "transparent" }}>
-                <HowItWorks colors={colors} />
-              </Card>
-            </>
+              {defaultUnavailable && fallback ? (
+                <Callout colors={colors} tone="warning" icon="TriangleAlert" title={t("overview.defaultUnavailable", { label: displayLabel(fallback.label, t) })} />
+              ) : null}
+            </View>
           ) : null}
         </View>
       </ScrollView>
@@ -294,7 +257,6 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
         <NameDialog
           colors={colors}
           title={t("dialog.addTitle")}
-          body={t("dialog.addBody")}
           initial=""
           confirmLabel={t("dialog.continue")}
           onClose={() => setDialog(null)}

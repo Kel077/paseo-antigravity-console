@@ -1,21 +1,20 @@
 {
-  "title": "Antigravity 账号",
-  "subtitle": "为每个 Antigravity agent 选择 Google 账号，切换账号时对话不会中断。",
+  "title": "Antigravity 控制台",
   "add": "添加账号",
   "refreshAll": "刷新",
-  "loading": "正在加载账号…",
+  "loading": "加载中…",
   "retry": "重试",
   "working": "处理中…",
+  "systemName": "系统登录",
   "overview": {
     "default": "新 agent 默认使用",
-    "defaultHint": "输入框里没有选择账号时使用。",
     "cli": "Antigravity CLI",
-    "cliMissing": "此主机上未找到",
+    "cliMissing": "未找到",
     "cliValue": "agy {{version}}",
-    "defaultUnavailable": "「{{label}}」尚未登录",
-    "defaultUnavailableBody": "在它登录之前，新 agent 会使用系统登录。"
+    "defaultUnavailable": "「{{label}}」未登录，新 agent 暂用系统登录"
   },
   "accountsHeading": "账号",
+  "settingsHeading": "设置",
   "hostProblems": "需要处理",
   "kind": {
     "system": "agy 钥匙串",
@@ -31,17 +30,17 @@
   "agents_zero": "没有 agent",
   "agents_other": "{{count}} 个 agent",
   "checked": "{{time}}检查过",
-  "neverChecked": "尚未检查",
+  "checkedJustNow": "刚刚检查",
+  "neverChecked": "未检查",
   "window": {
     "weekly": "每周",
     "5h": "5 小时",
     "daily": "每日",
     "monthly": "每月"
   },
-  "left": "剩余 {{value}}",
   "resets": "{{time}}重置",
   "off": "已停用",
-  "noQuota": "agy 没有报告这个账号的额度。",
+  "noQuota": "没有额度数据",
   "action": {
     "more": "更多操作",
     "refresh": "刷新",
@@ -53,28 +52,16 @@
     "remove": "移除账号"
   },
   "callout": {
-    "signedOutTitle": "尚未登录",
-    "signedOutBody": "用这个账号要使用的 Google 账号登录。",
-    "systemSignedOutBody": "在这台主机的终端里运行 agy，登录系统账号。",
-    "errorTitle": "无法检查这个账号",
+    "signedOutTitle": "未登录",
+    "systemSignedOutBody": "在终端运行 agy 登录。",
+    "errorTitle": "检查失败",
     "unusableTitle": "为保护系统登录已停用"
   },
   "empty": {
-    "title": "添加另一个 Google 账号",
-    "body": "每个附加账号单独保存登录信息。新建 agent 时可以在输入框里选它；额度不够时，也能把正在运行的 agent 切过去。"
-  },
-  "how": {
-    "title": "工作原理",
-    "switchTitle": "切换账号不会丢失对话",
-    "switchBody": "所有账号共用同一个会话库。切换时会在新账号下重新打开这个 agent 的会话，从原来的位置继续。",
-    "modelsTitle": "模型列表来自系统登录",
-    "modelsBody": "如果附加账号的套餐没有某个模型，请换一个它支持的模型。",
-    "safetyTitle": "各账号的登录互相独立",
-    "safetyBody": "每个附加账号的登录信息保存在它自己的配置目录里。插件会检查 agy 把登录写到了哪里，写错位置的账号会被自动停用。"
+    "title": "添加另一个 Google 账号"
   },
   "dialog": {
     "addTitle": "添加账号",
-    "addBody": "起一个好认的名字，比如「工作」或「个人」。下一步登录 Google。",
     "renameTitle": "重命名账号",
     "name": "名称",
     "namePlaceholder": "工作",
@@ -82,22 +69,20 @@
     "save": "保存",
     "cancel": "取消",
     "removeTitle": "移除「{{label}}」？",
-    "removeBody": "已保存的登录信息会被删除，对话会保留。正在使用这个账号的 agent 需要先切换到其他账号才能继续运行。",
+    "removeBody": "登录信息会被删除，对话保留。",
     "removeConfirm": "移除"
   },
   "signin": {
     "title": "登录「{{label}}」",
-    "preparing": "正在生成登录链接…",
+    "preparing": "准备中…",
     "step1Title": "打开 Google 登录",
-    "step1Body": "用要给这个账号使用的 Google 账号登录。",
     "open": "打开登录页",
     "copy": "复制链接",
     "copied": "已复制链接",
     "step2Title": "粘贴授权码",
-    "step2Body": "登录后 Google 会显示一个授权码。也可以粘贴那个页面的完整网址。",
-    "placeholder": "4/0A…",
+    "placeholder": "授权码，或登录后跳转页面的网址",
     "submit": "完成登录",
-    "waiting": "正在等待 agy 确认…",
+    "waiting": "正在等待 agy…",
     "expires": "链接{{time}}失效",
     "expired": "链接已失效。",
     "restart": "重新获取链接",
@@ -131,13 +116,50 @@
     "output": "输出",
     "window": "窗口大小",
     "sourceAgy": "agy 报告",
-    "sourceModel": "按模型估算",
+    "sourceModel": "估算",
     "updated": "{{time}}更新",
-    "note": "取自这段对话最近一次模型调用。",
-    "none": "这段对话还没有模型调用。",
-    "tokens": "tokens",
-    "updatedJustNow": "刚刚更新"
+    "updatedJustNow": "刚刚更新",
+    "note": "最近一次模型调用。",
+    "none": "还没有模型调用。",
+    "tokens": "tokens"
   },
-  "systemName": "系统登录",
-  "checkedJustNow": "刚刚检查"
+  "stats": {
+    "title": "用量",
+    "range": {
+      "24h": "24 小时",
+      "7d": "7 天",
+      "30d": "30 天"
+    },
+    "requests": "请求次数",
+    "speed": "输出速度",
+    "cache": "缓存命中率",
+    "firstToken": "首字延迟",
+    "conversations_other": "{{count}} 段对话",
+    "outputTokens": "输出 {{value}} tokens",
+    "cachedTokens": "命中 {{value}} tokens",
+    "avgContext": "平均上下文 {{value}}",
+    "perHour": "每小时请求",
+    "perSixHours": "每 6 小时请求",
+    "perDay": "每天请求",
+    "readoutRequests_other": "{{count}} 次请求",
+    "readoutTps": "{{value}} tok/s",
+    "readoutCache": "缓存 {{value}}",
+    "readoutFirstToken": "首字 {{value}}",
+    "noRequests": "无请求",
+    "empty": "这段时间没有 Antigravity 请求",
+    "models": "按模型",
+    "tps": "{{value}} tok/s",
+    "col": {
+      "model": "模型",
+      "requests": "请求",
+      "context": "平均上下文",
+      "output": "平均输出",
+      "speed": "速度",
+      "cache": "缓存命中",
+      "firstToken": "首字延迟"
+    }
+  },
+  "sidebar": {
+    "label": "Antigravity：5 小时额度剩余 {{fiveHour}}，每周额度剩余 {{weekly}}"
+  }
 }
