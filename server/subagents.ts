@@ -25,6 +25,10 @@ const TIME_HEADER = /^(?:(?:Created|Completed) At: [^\n]*\n)+/;
 const STALE_MS = 12 * 60_000;
 const MAX_DEPTH = 3;
 const MAX_ENTRIES = 300;
+/** Step states agy may still rewrite in place. */
+const UNFINISHED = new Set(["RUNNING", "PENDING", "GENERATING", "WAITING", "QUEUED"]);
+/** How far back an unfinished step is looked for when resuming a read. */
+const RESUME_WINDOW = 64;
 
 interface ToolCall {
   name: string;
@@ -59,8 +63,8 @@ interface CachedLog {
   size: number;
   mtimeMs: number;
   rows: Row[];
-  /** Where the last complete line starts; reading resumes there. */
-  offset: number;
+  /** Byte offset where each row's line starts. */
+  starts: number[];
 }
 
 function logPath(conversationId: string): string {
@@ -94,6 +98,7 @@ function argValue(value: unknown): unknown {
 
 function argText(call: ToolCall, key: string): string | null {
   const value = argValue(call.args?.[key]);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
@@ -149,10 +154,43 @@ function clip(text: string | null | undefined, max: number): string | null {
   return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
 }
 
-/** The text the parent sent, without agy's `<SYSTEM_MESSAGE>` wrapper. */
+/** The text of a message, without agy's `<SYSTEM_MESSAGE>` or `<USER_REQUEST>` wrapper. */
 function messageBody(content: string): string {
-  const inner = /content=([\s\S]*?)(?:<\/SYSTEM_MESSAGE>|$)/.exec(content)?.[1] ?? content;
-  return inner.trim();
+  if (content.includes("<SYSTEM_MESSAGE>")) {
+    const inner = /content=([\s\S]*?)(?:<\/SYSTEM_MESSAGE>|$)/.exec(content)?.[1];
+    if (inner !== undefined) return inner.trim();
+  }
+  const request = /<USER_REQUEST>([\s\S]*?)(?:<\/USER_REQUEST>|$)/.exec(content)?.[1];
+  return (request ?? content).trim();
+}
+
+/** Whether a conversation's first message came from `parentId` (agy names the sender). */
+function sentBy(rows: readonly Row[], parentId: string): boolean | null {
+  const first = rows.find((row) => row.type === "SYSTEM_MESSAGE" || row.type === "USER_INPUT");
+  if (!first?.content) return null;
+  return first.content.includes(`sender=${parentId}`);
+}
+
+/** Roles and types `manage_subagents` listed, by conversation id. */
+function listedRoles(content: string): Map<string, { role: string | null; type: string | null }> {
+  const result = new Map<string, { role: string | null; type: string | null }>();
+  const start = content.indexOf("[");
+  const end = content.lastIndexOf("]");
+  if (start < 0 || end <= start) return result;
+  try {
+    const entries: unknown = JSON.parse(content.slice(start, end + 1));
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      const record = entry as { conversationId?: unknown; role?: unknown; type?: unknown };
+      if (typeof record.conversationId !== "string") continue;
+      result.set(record.conversationId, {
+        role: typeof record.role === "string" ? record.role : null,
+        type: typeof record.type === "string" ? record.type : null,
+      });
+    }
+  } catch {
+    // Not a list.
+  }
+  return result;
 }
 
 export class SubagentReader {
@@ -162,88 +200,93 @@ export class SubagentReader {
   constructor(private readonly agents: ContextReader) {}
 
   /**
-   * Reads a conversation log incrementally. agy appends a line per step but may rewrite the last
-   * line while that step runs, so the last complete line is read again every time.
+   * Reads a conversation log incrementally. agy appends a line per step and rewrites a step's line
+   * while it runs, so reading resumes at the earliest step that may still change.
    */
   private async rows(conversationId: string): Promise<{ rows: Row[]; mtimeMs: number } | null> {
     const file = logPath(conversationId);
     const stat = await fs.stat(file).catch(() => null);
     if (!stat?.isFile()) return null;
-    let cached = this.logs.get(file);
+    const cached = this.logs.get(file);
     if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
       return { rows: cached.rows, mtimeMs: stat.mtimeMs };
     }
-    if (!cached || stat.size < cached.offset) cached = { size: 0, mtimeMs: 0, rows: [], offset: 0 };
-    const length = stat.size - cached.offset;
-    const buffer = Buffer.alloc(Math.max(0, length));
-    const handle = await fs.open(file, "r");
-    try {
-      if (length > 0) await handle.read(buffer, 0, length, cached.offset);
-    } finally {
-      await handle.close();
-    }
-    const rows = cached.rows.slice();
-    const end = buffer.lastIndexOf(0x0a);
-    let lastStart = 0;
-    if (end >= 0) {
-      let start = 0;
-      for (;;) {
-        const newline = buffer.indexOf(0x0a, start);
-        const stop = newline < 0 || newline > end ? end : newline;
-        const line = buffer.subarray(start, stop).toString("utf8").trim();
-        if (line) {
-          try {
-            const row = JSON.parse(line) as Row;
-            if (typeof row.step_index === "number") {
-              let at = rows.length - 1;
-              while (at >= 0 && rows[at]!.step_index > row.step_index) at -= 1;
-              if (at >= 0 && rows[at]!.step_index === row.step_index) rows[at] = row;
-              else rows.splice(at + 1, 0, row);
-            }
-          } catch {
-            // A torn line: skip it.
-          }
+    let keep = 0;
+    if (cached?.rows.length) {
+      keep = cached.rows.length - 1;
+      for (let index = Math.max(0, cached.rows.length - RESUME_WINDOW); index < cached.rows.length; index += 1) {
+        if (UNFINISHED.has(cached.rows[index]!.status ?? "")) {
+          keep = index;
+          break;
         }
-        lastStart = start;
-        if (stop >= end) break;
-        start = stop + 1;
       }
     }
-    const offset = end >= 0 ? cached.offset + lastStart : cached.offset;
-    this.logs.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, rows, offset });
-    return { rows, mtimeMs: stat.mtimeMs };
+    const offset = cached?.rows.length ? cached.starts[keep]! : 0;
+    const parsed = await readRows(file, offset, stat.size);
+    // The first line read must be the step it resumes at; anything else means the file was rewritten.
+    const aligned =
+      !cached?.rows.length || (parsed !== null && parsed.rows[0]?.step_index === cached.rows[keep]!.step_index);
+    const next: CachedLog = aligned && parsed
+      ? {
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          rows: [...(cached?.rows.slice(0, keep) ?? []), ...parsed.rows],
+          starts: [...(cached?.starts.slice(0, keep) ?? []), ...parsed.starts],
+        }
+      : { size: stat.size, mtimeMs: stat.mtimeMs, ...((await readRows(file, 0, stat.size)) ?? { rows: [], starts: [] }) };
+    dedupe(next);
+    this.logs.set(file, next);
+    return { rows: next.rows, mtimeMs: stat.mtimeMs };
   }
 
-  /** The children a conversation created, with the role and task it gave each. */
+  /**
+   * The children a conversation created, with the role and task it gave each. Each tool call of a
+   * response gets one result line, in call order, before the next response; an `invoke_subagent`
+   * result names the conversation it created.
+   */
   private async children(conversationId: string): Promise<Child[]> {
     const log = await this.rows(conversationId);
     if (!log) return [];
-    const pending: Array<{ role: string | null; type: string | null; task: string }> = [];
     const found: Child[] = [];
     const killed = new Map<string, string | null>();
+    const listed = new Map<string, { role: string | null; type: string | null }>();
+    let queue: ToolCall[] = [];
     for (const row of log.rows) {
-      for (const call of row.tool_calls ?? []) {
-        if (call.name === "manage_subagents" && argText(call, "Action") === "kill") {
+      if (row.type === "PLANNER_RESPONSE") {
+        // A result that never arrived must not shift the next response's pairing.
+        queue = [...(row.tool_calls ?? [])];
+        for (const call of queue) {
+          if (call.name !== "manage_subagents" || argText(call, "Action") !== "kill") continue;
           const ids = argValue(call.args?.ConversationIds);
           for (const id of Array.isArray(ids) ? ids : []) {
             if (typeof id === "string") killed.set(id, row.created_at ?? null);
           }
         }
-        if (call.name !== "invoke_subagent") continue;
-        pending.push({
-          role: argText(call, "Role"),
-          type: argText(call, "TypeName"),
-          task: argText(call, "Prompt") ?? "",
-        });
+        continue;
       }
-      const id = row.content ? CREATED_ID.exec(row.content)?.[1] : undefined;
-      if (id && UUID.test(id) && !found.some((child) => child.id === id)) {
-        const call = pending.shift() ?? { role: null, type: null, task: "" };
-        found.push({ id, ...call, killedAt: null });
+      if (row.type !== "GENERIC") continue;
+      const call = queue.shift();
+      if (!call || !row.content) continue;
+      if (call.name === "manage_subagents") {
+        for (const [id, entry] of listedRoles(row.content)) listed.set(id, entry);
+        continue;
       }
+      if (call.name !== "invoke_subagent") continue;
+      const id = CREATED_ID.exec(row.content)?.[1];
+      if (!id || !UUID.test(id) || found.some((child) => child.id === id)) continue;
+      found.push({
+        id,
+        role: argText(call, "Role"),
+        type: argText(call, "TypeName"),
+        task: argText(call, "Prompt") ?? "",
+        killedAt: null,
+      });
     }
     for (const child of found) {
       if (killed.has(child.id)) child.killedAt = killed.get(child.id) ?? "";
+      const entry = listed.get(child.id);
+      child.role ??= entry?.role ?? null;
+      child.type ??= entry?.type ?? null;
     }
     return found;
   }
@@ -304,12 +347,15 @@ export class SubagentReader {
       .catch(() => fs.stat(path.join(REAL_CLI_DIR, "conversations", `${child.id}.db`)).catch(() => null));
     const touched = Math.max(log?.mtimeMs ?? 0, dbStat?.mtimeMs ?? 0);
     const finalAnswer = last?.type === "PLANNER_RESPONSE" && last.status === "DONE" && !(last.tool_calls?.length);
+    // A tool error is routine; an error in the model's own step ends the run.
+    const failed = Boolean(last && (last.type?.includes("ERROR") || (last.status === "ERROR" && last.type !== "GENERIC")));
     let state: SubagentState;
     let phase: "thinking" | "tool" | null = null;
-    if (child.killedAt !== null && !finalAnswer) state = "stopped";
+    if (child.killedAt !== null && !(finalAnswer && reported)) state = "stopped";
     else if (!last) state = parentClosed ? "stopped" : "running";
     else if (last.status === "CANCELED" || last.status === "INTERRUPTED") state = "stopped";
-    else if (finalAnswer) state = reported ? "done" : "idle";
+    else if (failed) state = "failed";
+    else if (finalAnswer) state = reported ? "done" : parentClosed ? "stopped" : "idle";
     else {
       state = "running";
       phase = last.type === "PLANNER_RESPONSE" && last.tool_calls?.length && last.status === "DONE" ? "tool" : "thinking";
@@ -331,7 +377,8 @@ export class SubagentReader {
       depth,
       role: child.role,
       type: child.type,
-      task: oneLine(child.task || messageBody(rows.find((row) => row.type === "SYSTEM_MESSAGE")?.content ?? ""), 600),
+      // The child's own first message holds the whole task; the parent's call may be cut short.
+      task: oneLine(messageBody(rows.find((row) => row.type === "SYSTEM_MESSAGE")?.content ?? "") || child.task, 600),
       state,
       phase,
       activity,
@@ -358,6 +405,9 @@ export class SubagentReader {
     if (!children.length) return;
     const inbox = await this.reports(conversationId);
     for (const child of children) {
+      // Only a conversation whose first message came from this parent is its child.
+      const own = await this.rows(child.id);
+      if (own && sentBy(own.rows, conversationId) === false) continue;
       const summary = await this.summarize(child, conversationId, depth, inbox.get(child.id), parentClosed);
       out.push(summary);
       await this.collect(child.id, depth + 1, parentClosed || summary.state === "stopped", out);
@@ -416,9 +466,14 @@ export class SubagentReader {
       }
       if (row.type === "PLANNER_RESPONSE") {
         const tools = (row.tool_calls ?? []).map((call) => {
-          if (call.name === "send_message") report = argText(call, "Message") ?? report;
+          const recipient = argText(call, "Recipient");
+          if (call.name === "send_message" && (!recipient || recipient === summary.parentId)) {
+            report = argText(call, "Message") ?? report;
+          }
           return { name: call.name, summary: describeCall(call), output: null, failed: false };
         });
+        // Results of an interrupted response never arrive; they must not shift this one's.
+        open.length = 0;
         open.push(...tools);
         entries.push({
           index: row.step_index,
@@ -454,9 +509,11 @@ export class SubagentReader {
     const inbox = await this.reports(summary.parentId);
     const full = inbox.get(subagentId)?.content ?? null;
     const truncated = entries.length > MAX_ENTRIES;
+    const task = entries[0]?.kind === "task" ? entries[0] : null;
     return {
       summary,
-      entries: truncated ? entries.slice(-MAX_ENTRIES) : entries,
+      // Keep the task when only the latest steps fit.
+      entries: truncated ? [...(task ? [task] : []), ...entries.slice(-(MAX_ENTRIES - 1))] : entries,
       report: full ?? report,
       truncated,
     };
@@ -465,4 +522,62 @@ export class SubagentReader {
   forget(agentId: string): void {
     this.listCache.delete(agentId);
   }
+}
+
+/** Parses the complete lines of `file` between `from` and `to`, with each line's start offset. */
+async function readRows(file: string, from: number, to: number): Promise<{ rows: Row[]; starts: number[] } | null> {
+  const length = Math.max(0, to - from);
+  const buffer = Buffer.alloc(length);
+  const handle = await fs.open(file, "r").catch(() => null);
+  if (!handle) return null;
+  try {
+    if (length > 0) await handle.read(buffer, 0, length, from);
+  } finally {
+    await handle.close();
+  }
+  const rows: Row[] = [];
+  const starts: number[] = [];
+  let start = 0;
+  for (;;) {
+    const newline = buffer.indexOf(0x0a, start);
+    // A line without its newline is still being written: leave it for the next read.
+    if (newline < 0) break;
+    const line = buffer.subarray(start, newline).toString("utf8").trim();
+    if (line) {
+      try {
+        const row = JSON.parse(line) as Row;
+        if (typeof row.step_index === "number") {
+          rows.push(row);
+          starts.push(from + start);
+        }
+      } catch {
+        if (rows.length === 0 && from > 0) return null;
+      }
+    }
+    start = newline + 1;
+  }
+  return { rows, starts };
+}
+
+/** Keeps the newest line of a step that agy wrote more than once. */
+function dedupe(log: CachedLog): void {
+  const seen = new Set<number>();
+  let duplicate = false;
+  for (const row of log.rows) {
+    if (seen.has(row.step_index)) duplicate = true;
+    seen.add(row.step_index);
+  }
+  if (!duplicate) return;
+  const rows: Row[] = [];
+  const starts: number[] = [];
+  const kept = new Set<number>();
+  for (let index = log.rows.length - 1; index >= 0; index -= 1) {
+    const row = log.rows[index]!;
+    if (kept.has(row.step_index)) continue;
+    kept.add(row.step_index);
+    rows.unshift(row);
+    starts.unshift(log.starts[index]!);
+  }
+  log.rows = rows;
+  log.starts = starts;
 }

@@ -11,6 +11,7 @@ import {
 } from "../shared/contracts";
 import type { AccountService } from "./accounts";
 import { commandEnv, runAgy } from "./agy";
+import { ensureProfile } from "./profile";
 import { REAL_CLI_DIR, REAL_SETTINGS_FILE, paseoHome, resolveAgy } from "./paths";
 
 /**
@@ -37,7 +38,12 @@ interface CatalogModel {
 interface Catalog {
   models: CatalogModel[];
   fetchedAt: number;
+  /** The sign-in the list belongs to; another Google account on the same profile lists anew. */
+  identity: string;
 }
+
+/** After a failed `agy models`, wait this long before trying the account again. */
+const FAILURE_BACKOFF_MS = 2 * 60_000;
 
 type SettingsJson = Record<string, unknown> & { orchestrator?: Record<string, unknown> };
 
@@ -62,8 +68,13 @@ async function readSettingsJson(): Promise<SettingsJson> {
   return parsed as SettingsJson;
 }
 
+function orchestratorOf(settings: SettingsJson): Record<string, unknown> {
+  const value = settings.orchestrator;
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
 function savedRole(settings: SettingsJson, role: "planner" | "executor"): string | null {
-  const value = settings.orchestrator?.[role];
+  const value = orchestratorOf(settings)[role];
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
@@ -118,35 +129,46 @@ function familiesFor(
   }
   const order = ["low", "medium", "high", "xhigh", "max"];
   const rank = (id: string) => order.indexOf(EFFORT_SUFFIX.exec(id)?.[1] ?? "");
-  return allowed
+  const available = allowed
     .map((id) => families.get(id))
     .filter((family): family is ModelFamily => Boolean(family))
-    // A family the user removed from Paseo's model list stays out of these choices too.
-    .filter((family) => !curated || family.variants.some((variant) => curated.has(variant.id)))
     .map((family) => ({ ...family, variants: family.variants.sort((a, b) => rank(a.id) - rank(b.id)) }));
+  // A family the user removed from Paseo's model list stays out of these choices too, unless that
+  // list names none of them (then it says nothing about planners and executors).
+  const kept = curated ? available.filter((family) => family.variants.some((variant) => curated.has(variant.id))) : available;
+  return kept.length ? kept : available;
 }
 
 export class OrchestratorSettings {
   private readonly catalogs = new Map<string, Catalog>();
+  private readonly failures = new Map<string, number>();
   private readonly pendingReloads = new Set<string>();
+  private readonly timers = new Set<NodeJS.Timeout>();
   private writing: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly service: AccountService) {}
 
-  private async catalog(accountId: string, refresh: boolean): Promise<CatalogModel[] | null> {
+  private async catalog(accountId: string, identity: string, refresh: boolean): Promise<CatalogModel[] | null> {
     const cached = this.catalogs.get(accountId);
-    if (cached && !refresh && Date.now() - cached.fetchedAt < CATALOG_TTL_MS) return cached.models;
+    const usable = cached && cached.identity === identity ? cached : undefined;
+    if (usable && !refresh && Date.now() - usable.fetchedAt < CATALOG_TTL_MS) return usable.models;
+    if (!refresh && Date.now() - (this.failures.get(accountId) ?? 0) < FAILURE_BACKOFF_MS) return usable?.models ?? null;
     const agy = await resolveAgy();
     if (!agy) throw new Error("Antigravity CLI (agy) was not found.");
+    if (accountId !== SYSTEM_ACCOUNT_ID) await ensureProfile(accountId);
     const result = await runAgy(agy, ["models"], {
       env: commandEnv(accountId),
       cwd: os.homedir(),
       timeoutMs: 30_000,
       stopWhen: /Authentication required/i,
     });
-    const models = parseCatalog(result.stdout);
-    if (!models.length) return cached?.models ?? null;
-    this.catalogs.set(accountId, { models, fetchedAt: Date.now() });
+    const models = result.code === 0 && !result.timedOut && !result.stopped ? parseCatalog(result.stdout) : [];
+    if (!models.length) {
+      this.failures.set(accountId, Date.now());
+      return usable?.models ?? null;
+    }
+    this.failures.delete(accountId);
+    this.catalogs.set(accountId, { models, fetchedAt: Date.now(), identity });
     return models;
   }
 
@@ -160,7 +182,7 @@ export class OrchestratorSettings {
     await Promise.all(
       accounts.map(async (account) => {
         try {
-          const models = await this.catalog(account.id, refresh);
+          const models = await this.catalog(account.id, account.email ?? "", refresh);
           if (models) catalogs.set(account.id, models);
         } catch (failure) {
           error = failure instanceof Error ? failure.message : String(failure);
@@ -205,7 +227,7 @@ export class OrchestratorSettings {
     }
     const run = this.writing.then(async () => {
       const settings = await readSettingsJson();
-      const orchestrator: Record<string, unknown> = { ...(settings.orchestrator ?? {}) };
+      const orchestrator: Record<string, unknown> = { ...orchestratorOf(settings) };
       for (const role of ["planner", "executor"] as const) {
         const value = update[role];
         if (value === undefined) continue;
@@ -231,26 +253,57 @@ export class OrchestratorSettings {
     if (!snapshot || snapshot.agent.archivedAt || !isAntigravityProvider(snapshot.agent.provider)) return "none";
     if (snapshot.agent.status === "running" || snapshot.agent.status === "initializing") {
       this.pendingReloads.add(agentId);
+      // The turn may have ended while this ran; then nothing would pick the reload up.
+      const again = await handle.refresh().catch(() => null);
+      if (again && again.agent.status !== "running" && again.agent.status !== "initializing" && this.pendingReloads.delete(agentId)) {
+        return (await this.reload(paseo, agentId)) ? "now" : "none";
+      }
       return "after-turn";
     }
-    await handle.reload();
-    return "now";
+    this.pendingReloads.delete(agentId);
+    return (await this.reload(paseo, agentId)) ? "now" : "none";
+  }
+
+  /** Reopens an idle agent. The settings are already saved, so a failure only delays them. */
+  private async reload(paseo: PaseoApi, agentId: string): Promise<boolean> {
+    try {
+      await paseo.agents.ref(agentId).reload();
+      return true;
+    } catch (error) {
+      console.error(`antigravity-accounts: could not reopen ${agentId}`, error);
+      return false;
+    }
   }
 
   register(server: PluginServerContext): Array<() => void> {
     return [
       server.addHook("agent.turn.after", async ({ agent }, { paseo }) => {
-        if (!this.pendingReloads.delete(agent.id)) return;
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        await paseo.agents
-          .ref(agent.id)
-          .reload()
-          .catch((error: unknown) => console.error(`antigravity-accounts: could not reopen ${agent.id}`, error));
+        if (!this.pendingReloads.has(agent.id)) return;
+        const timer = setTimeout(() => {
+          this.timers.delete(timer);
+          void (async () => {
+            if (!this.pendingReloads.has(agent.id)) return;
+            const snapshot = await paseo.agents.ref(agent.id).refresh().catch(() => null);
+            if (!snapshot || snapshot.agent.archivedAt) {
+              this.pendingReloads.delete(agent.id);
+              return;
+            }
+            // Another turn started meanwhile: wait for that one.
+            if (snapshot.agent.status === "running" || snapshot.agent.status === "initializing") return;
+            this.pendingReloads.delete(agent.id);
+            await this.reload(paseo, agent.id);
+          })();
+        }, 500);
+        this.timers.add(timer);
       }),
       server.addHook("agent.archive.after", async ({ agent }) => {
         this.pendingReloads.delete(agent.id);
       }),
-      () => this.pendingReloads.clear(),
+      () => {
+        for (const timer of this.timers) clearTimeout(timer);
+        this.timers.clear();
+        this.pendingReloads.clear();
+      },
     ];
   }
 }
