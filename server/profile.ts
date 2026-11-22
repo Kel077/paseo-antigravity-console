@@ -1,4 +1,4 @@
-import type { Dirent } from "node:fs";
+import type { Dirent, Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -107,7 +107,7 @@ async function mirror(
 
 async function syncProfile(accountId: string): Promise<string> {
   const home = profileHome(accountId);
-  await fs.mkdir(profileRoot(accountId), { recursive: true, mode: 0o700 });
+  await ensureRealDir(profileRoot(accountId));
   await ensureRealDir(home);
   await mirror(REAL_HOME, home, (name) => name === ".gemini");
 
@@ -152,10 +152,32 @@ export function ensureProfile(accountId: string): Promise<string> {
   return withLock(accountId, () => syncProfile(accountId));
 }
 
-/** Entries of `dir` when it is a real directory. Never follows a symlink into the real home. */
-async function realEntries(dir: string): Promise<Dirent[]> {
-  const stat = await fs.lstat(dir).catch(() => null);
-  return stat?.isDirectory() ? readDirSafe(dir) : [];
+/**
+ * Looks at a path in an account's profile without following links, but only when it is reached
+ * from the profile folder through real folders. A linked folder on the way leads elsewhere: with a
+ * `.gemini` that links to the real one, deleting the profile's agy data would delete the system
+ * account's. Null for such paths, for paths outside the profile and for missing ones.
+ */
+async function profileEntry(accountId: string, target: string): Promise<Stats | null> {
+  const root = profileRoot(accountId);
+  const relative = path.relative(root, target);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    return null;
+  }
+  let current = root;
+  let stat = await fs.lstat(current).catch(() => null);
+  for (const part of relative ? relative.split(path.sep) : []) {
+    // lstat: a link to a folder is not a directory here.
+    if (!stat?.isDirectory()) return null;
+    current = path.join(current, part);
+    stat = await fs.lstat(current).catch(() => null);
+  }
+  return stat;
+}
+
+/** Entries of a real folder in the profile. Never reads through a link, into the real home or elsewhere. */
+async function realEntries(accountId: string, dir: string): Promise<Dirent[]> {
+  return (await profileEntry(accountId, dir))?.isDirectory() ? readDirSafe(dir) : [];
 }
 
 /** True when a file, or a folder with at least one file or link somewhere inside. */
@@ -175,7 +197,7 @@ export async function savedFiles(accountId: string): Promise<string[]> {
   const home = profileHome(accountId);
   const found: string[] = [];
   const collect = async (dir: string, skip: string) => {
-    for (const entry of await realEntries(dir)) {
+    for (const entry of await realEntries(accountId, dir)) {
       if (entry.isSymbolicLink() || entry.name === skip) continue;
       const full = path.join(dir, entry.name);
       if (await holdsData(full, entry)) found.push(path.relative(home, full));
@@ -235,8 +257,11 @@ async function freePath(destination: string): Promise<string> {
   }
 }
 
-/** Moves a file or folder without replacing anything, copying when it crosses to another volume. */
-async function move(source: string, destination: string): Promise<void> {
+/**
+ * Moves a file or folder out of the profile without replacing anything, copying when it crosses to
+ * another volume. The copied source is deleted only while it is still behind real folders.
+ */
+async function move(accountId: string, source: string, destination: string): Promise<void> {
   await fs.mkdir(path.dirname(destination), { recursive: true });
   const target = await freePath(destination);
   try {
@@ -255,25 +280,24 @@ async function move(source: string, destination: string): Promise<void> {
         return stat.isFile() || stat.isDirectory() || stat.isSymbolicLink();
       },
     });
-    await fs.rm(source, { recursive: true, force: true });
+    if (await profileEntry(accountId, source)) await fs.rm(source, { recursive: true, force: true });
   }
 }
 
 /**
  * Deletes what is left of a profile once its saved files are out: links into the real home,
- * sockets and other special files, and empty folders. Never deletes a regular file, so a file
- * written after the scan stays where it is. True when the whole folder is gone.
+ * sockets and other special files, and empty folders. A link is removed, never followed, and a
+ * regular file is never deleted, so a file written after the scan stays where it is. True when
+ * nothing is left at `dir`.
  */
 async function clearProfile(dir: string): Promise<boolean> {
-  for (const entry of await readDirSafe(dir)) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) await clearProfile(full);
-    else if (!entry.isFile()) await fs.unlink(full).catch(() => undefined);
-  }
-  return fs.rmdir(dir).then(
-    () => true,
-    (error: unknown) => errorCode(error) === "ENOENT",
-  );
+  const stat = await fs.lstat(dir).catch(() => null);
+  if (!stat) return true;
+  if (stat.isFile()) return false;
+  const gone = (error: unknown) => errorCode(error) === "ENOENT";
+  if (!stat.isDirectory()) return fs.unlink(dir).then(() => true, gone);
+  for (const entry of await readDirSafe(dir)) await clearProfile(path.join(dir, entry.name));
+  return fs.rmdir(dir).then(() => true, gone);
 }
 
 export interface PreservedFiles {
@@ -286,28 +310,36 @@ export interface PreservedFiles {
 /**
  * Deletes a profile. Files agents saved in its HOME are first moved to a new folder under
  * RECOVERY_DIR, then agy's data for the account, its sign-in included, is deleted. A failed move
- * stops the removal, and agy's data is deleted only after every file found was moved. Nothing
- * outside agy's data is deleted recursively; symlinks go without touching what they point at.
+ * stops the removal, and agy's data is deleted only after every file found was moved. Only agy's
+ * data is deleted recursively, and only when every folder from the profile folder down to it is a
+ * real folder. Links anywhere in the profile are removed without touching what they point at.
  */
 export function removeProfile(accountId: string, label: string): Promise<PreservedFiles | null> {
   return withLock(accountId, async () => {
     const home = profileHome(accountId);
+    const cli = profileCliDir(accountId);
     let folder: string | null = null;
     const moved: string[] = [];
     const movedSoFar = () => (folder ? ` Files moved so far are in ${displayPath(folder)}.` : "");
     // A running agent can still write while this runs: whatever appears is moved on the next pass.
     for (let pass = 1; pass <= 3; pass++) {
       for (const item of await savedFiles(accountId)) {
+        const source = path.join(home, item);
+        // Listed behind real folders a moment ago; skip it if a folder above it became a link since.
+        if (!(await profileEntry(accountId, source))) continue;
         folder ??= await claimRecoveryFolder(label);
         try {
-          await move(path.join(home, item), path.join(folder, item));
+          await move(accountId, source, path.join(folder, item));
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           throw new Error(`Couldn't move ${item} out of the account's home folder: ${reason}.${movedSoFar()}`);
         }
         if (!moved.includes(item)) moved.push(item);
       }
-      if (pass === 1) await fs.rm(profileCliDir(accountId), { recursive: true, force: true });
+      // Behind a linked folder this would be another account's agy data, such as the system one's.
+      if (pass === 1 && (await profileEntry(accountId, cli))?.isDirectory()) {
+        await fs.rm(cli, { recursive: true, force: true });
+      }
       if (await clearProfile(profileRoot(accountId))) return folder ? { folder, items: moved } : null;
     }
     throw new Error(`Files keep appearing in the account's home folder. Stop its agents and remove it again.${movedSoFar()}`);
@@ -382,24 +414,30 @@ export async function scanAfterSignIn(accountId: string, since: number): Promise
   return { own, leaked };
 }
 
-/** Deletes the sign-in files recorded for a profile (or found by name when none were recorded). */
-export async function deleteSignIn(accountId: string, recorded: readonly string[]): Promise<string[]> {
-  const home = profileHome(accountId);
-  const cli = profileCliDir(accountId);
-  const targets = new Set<string>();
-  for (const relative of recorded) {
-    const full = path.resolve(home, relative);
-    if (full.startsWith(cli + path.sep)) targets.add(full);
-  }
-  if (targets.size === 0) {
-    for (const file of await scanCredentialFiles(cli, { since: 0, maxDepth: 2 })) targets.add(file);
-  }
-  const removed: string[] = [];
-  for (const file of targets) {
-    const stat = await fs.lstat(file).catch(() => null);
-    if (!stat || stat.isSymbolicLink() || !stat.isFile()) continue;
-    await fs.unlink(file);
-    removed.push(path.relative(home, file));
-  }
-  return removed;
+/**
+ * Deletes the sign-in files recorded for a profile (or found by name when none were recorded).
+ * Only files behind real folders: through a linked `.gemini` they would be the system sign-in.
+ */
+export function deleteSignIn(accountId: string, recorded: readonly string[]): Promise<string[]> {
+  return withLock(accountId, async () => {
+    const home = profileHome(accountId);
+    const cli = profileCliDir(accountId);
+    if (!(await profileEntry(accountId, cli))?.isDirectory()) return [];
+    const targets = new Set<string>();
+    for (const relative of recorded) {
+      const full = path.resolve(home, relative);
+      if (full.startsWith(cli + path.sep)) targets.add(full);
+    }
+    if (targets.size === 0) {
+      for (const file of await scanCredentialFiles(cli, { since: 0, maxDepth: 2 })) targets.add(file);
+    }
+    const removed: string[] = [];
+    for (const file of targets) {
+      // lstat: a link is not a file here.
+      if (!(await profileEntry(accountId, file))?.isFile()) continue;
+      await fs.unlink(file);
+      removed.push(path.relative(home, file));
+    }
+    return removed;
+  });
 }
