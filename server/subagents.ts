@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoApi } from "./types";
 import type {
   SubagentDetail,
   SubagentList,

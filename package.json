@@ -1,7 +1,21 @@
 {
-  "name": "antigravity-accounts",
+  "name": "paseo-antigravity-console",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Multiple Google accounts with automatic fallback, quota and usage, subagent views and Orchestrator model choices for Paseo's built-in Antigravity provider.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kel077/paseo-antigravity-console.git"
+  },
+  "homepage": "https://github.com/Kel077/paseo-antigravity-console#readme",
+  "keywords": [
+    "paseo",
+    "paseo-plugin",
+    "antigravity",
+    "agy",
+    "gemini"
+  ],
   "files": [
     "paseo-plugin.json",
     "OVERVIEW.md",
@@ -12,7 +26,10 @@
     "index.server.tsx",
     "client/",
     "server/",
-    "shared/"
+    "shared/",
+    "assets/",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit"

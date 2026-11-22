@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoApi } from "./types";
 import { isAntigravityProvider, type ContextUsage } from "../shared/contracts";
 import { REAL_CLI_DIR, SHARED_CLI_DIRS } from "./paths";
 import { decode, int as number, message } from "./protobuf";

@@ -1,4 +1,4 @@
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoApi } from "./types";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   ACCOUNT_METADATA_KEY,

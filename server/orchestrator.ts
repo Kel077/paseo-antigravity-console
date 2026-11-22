@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoApi } from "./types";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   SYSTEM_ACCOUNT_ID,

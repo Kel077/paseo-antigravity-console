@@ -1,9 +1,20 @@
 {
   "id": "antigravity-accounts",
-  "media": [],
+  "name": "Antigravity Console",
+  "description": "Multiple Google accounts with automatic fallback, quota and usage, subagent views and Orchestrator model choices for Paseo's built-in Antigravity provider.",
+  "media": [
+    "assets/console.png",
+    "assets/subagents.png",
+    "assets/timeline.png",
+    "assets/accounts.png"
+  ],
   "requirements": {
     "paseo": ">=0.16.2"
   },
-  "name": "Antigravity Console",
-  "description": "Usage, quota and multiple Google accounts for the built-in Antigravity provider, with per-agent account switching that keeps the conversation."
+  "translations": {
+    "zh-CN": {
+      "name": "Antigravity 控制台",
+      "description": "为 Paseo 内置的 Antigravity provider 提供多账号、出错自动切换、额度与用量、子代理查看和 Orchestrator 模型设置。"
+    }
+  }
 }

@@ -150,6 +150,7 @@ export function createSubagentViews(client: PluginClientContext) {
     const summary = query.data?.subagents.find((subagent) => subagent.id === card.id);
     const state = shownState(summary, card.status);
     const activity = activityLine(summary, t);
+    const thinking = summary?.state === "running" && summary.phase === "thinking";
     const title = summary?.role ?? card.type ?? t("subagents.title");
     return (
       <Pressable
@@ -197,7 +198,14 @@ export function createSubagentViews(client: PluginClientContext) {
             {card.task}
           </Text>
           {activity ? (
-            <Text numberOfLines={1} style={{ ...font.caption, color: colors.foreground, fontFamily: mono }}>
+            <Text
+              numberOfLines={1}
+              style={
+                thinking
+                  ? { ...font.caption, color: colors.foregroundMuted, fontStyle: "italic" }
+                  : { ...font.caption, color: colors.foreground, fontFamily: mono }
+              }
+            >
               {activity}
             </Text>
           ) : null}
@@ -436,7 +444,14 @@ function ListRow({
           </Text>
         ) : null}
         {activity ? (
-          <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted, fontFamily: mono }}>
+          <Text
+            numberOfLines={1}
+            style={{
+              ...font.caption,
+              color: colors.foregroundMuted,
+              ...(subagent.state === "running" && subagent.phase === "thinking" ? { fontStyle: "italic" as const } : { fontFamily: mono }),
+            }}
+          >
             {activity}
           </Text>
         ) : null}

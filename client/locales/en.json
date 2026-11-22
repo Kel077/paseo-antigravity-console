@@ -238,7 +238,7 @@
     "default": "agy default",
     "pillTitle": "Orchestrator models",
     "pillDefault": "Default",
-    "missingOn": "Not on {{accounts}}, which use agy's default",
+    "missingOn": "Not available on {{accounts}}; agy's default is used there",
     "applied": {
       "now": "Saved; this agent reopened with it",
       "after-turn": "Saved; applies to this agent after this turn",
