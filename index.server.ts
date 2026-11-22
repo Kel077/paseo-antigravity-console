@@ -9,6 +9,7 @@ import {
   refreshAccountsRpc,
   removeAccountRpc,
   renameAccountRpc,
+  savedFilesRpc,
   setFallbackRpc,
   setDefaultAccountRpc,
   setOrchestratorRpc,
@@ -106,10 +107,15 @@ export default function contribute(server: PluginServerContext) {
     return service.state();
   });
 
+  server.handle(savedFilesRpc, async ({ accountId }) => {
+    await ready;
+    return service.savedFiles(accountId);
+  });
+
   server.handle(removeAccountRpc, async ({ accountId }) => {
     await ready;
-    await service.remove(accountId);
-    return service.state();
+    const moved = await service.remove(accountId);
+    return { state: await service.state(), moved };
   });
 
   server.handle(signOutAccountRpc, async ({ accountId }) => {

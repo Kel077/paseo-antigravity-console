@@ -310,11 +310,19 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
       {dialog?.kind === "remove" ? (
         <ConfirmRemove
           colors={colors}
+          accountId={dialog.account.id}
           label={displayLabel(dialog.account.label, t)}
           onClose={() => setDialog(null)}
           onConfirm={async () => {
-            accept(await remove({ accountId: dialog.account.id }));
+            const { state, moved } = await remove({ accountId: dialog.account.id });
+            accept(state);
             setDialog(null);
+            if (moved) {
+              toast.show(t("dialog.removedMoved", { count: moved.items.length, folder: moved.folder }), {
+                variant: "success",
+                durationMs: 8000,
+              });
+            }
           }}
         />
       ) : null}

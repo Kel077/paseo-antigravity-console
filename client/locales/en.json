@@ -70,7 +70,13 @@
     "save": "Save",
     "cancel": "Cancel",
     "removeTitle": "Remove “{{label}}”?",
-    "removeBody": "Its sign-in is deleted. Conversations stay.",
+    "removeBody": "Deletes its sign-in and the data agy keeps for this account, such as logs and caches. Conversations stay.",
+    "removeFiles_one": "{{count}} item in this account's home folder will be moved to:",
+    "removeFiles_other": "{{count}} items in this account's home folder will be moved to:",
+    "removeFilesUnknown": "Files saved in this account's home folder will be moved to:",
+    "removeMore": "and {{count}} more",
+    "removedMoved_one": "Moved {{count}} item to {{folder}}",
+    "removedMoved_other": "Moved {{count}} items to {{folder}}",
     "removeConfirm": "Remove"
   },
   "signin": {

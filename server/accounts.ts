@@ -4,16 +4,24 @@ import {
   type AccountsState,
   type FallbackSettings,
   type QuotaGroup,
+  type SavedFiles,
 } from "../shared/contracts";
 import { agyVersion, probeAccount, readAccountEmail } from "./agy";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { dataDir, profileHome, resolveAgy } from "./paths";
-
-const statusFile = () => path.join(dataDir(), "status.json");
-import { deleteSignIn, ensureProfile, removeProfile, scanAfterSignIn } from "./profile";
+import { dataDir, displayPath, profileHome, resolveAgy } from "./paths";
+import {
+  deleteSignIn,
+  ensureProfile,
+  recoveryFolder,
+  removeProfile,
+  savedFiles,
+  scanAfterSignIn,
+} from "./profile";
 import { SignInManager } from "./signin";
 import { AccountStore, type StoredAccount } from "./store";
+
+const statusFile = () => path.join(dataDir(), "status.json");
 
 interface RuntimeStatus {
   status: AccountSummary["status"];
@@ -319,16 +327,27 @@ export class AccountService {
     this.changed();
   }
 
-  async remove(accountId: string): Promise<void> {
-    this.requireProfileAccount(accountId);
+  /** What removing a profile account would move out of its home folder, and to where. */
+  async savedFiles(accountId: string): Promise<SavedFiles> {
+    const account = this.requireProfileAccount(accountId);
+    return {
+      items: await savedFiles(accountId),
+      folder: displayPath(await recoveryFolder(account.label)),
+    };
+  }
+
+  /** Removes a profile account. Returns where its saved files went, or null when it had none. */
+  async remove(accountId: string): Promise<SavedFiles | null> {
+    const account = this.requireProfileAccount(accountId);
     this.signIns.cancelForAccount(accountId);
-    await removeProfile(accountId);
+    const preserved = await removeProfile(accountId, account.label);
     await this.store.update((data) => {
-      data.accounts = data.accounts.filter((account) => account.id !== accountId);
+      data.accounts = data.accounts.filter((entry) => entry.id !== accountId);
       if (data.defaultAccountId === accountId) data.defaultAccountId = SYSTEM_ACCOUNT_ID;
     });
     this.runtime.delete(accountId);
     this.changed();
+    return preserved ? { items: preserved.items, folder: displayPath(preserved.folder) } : null;
   }
 
   async signOut(accountId: string): Promise<void> {

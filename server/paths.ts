@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { RECOVERY_FOLDER_NAME } from "../shared/contracts";
 
 /** The daemon user's real home. agy keeps the system sign-in's data in `<home>/.gemini`. */
 export const REAL_HOME = os.homedir();
@@ -16,6 +17,16 @@ export const REAL_SETTINGS_FILE = path.join(REAL_CLI_DIR, "settings.json");
  * real ones, so a conversation started on one account can be reopened on another.
  */
 export const SHARED_CLI_DIRS = ["conversations", "brain", "implicit"] as const;
+
+/** Files agents saved in a removed account's HOME are moved here, one folder per account. */
+export const RECOVERY_DIR = path.join(REAL_HOME, RECOVERY_FOLDER_NAME);
+
+/** A path for people to read: inside the real home it starts with `~`. */
+export function displayPath(file: string): string {
+  return file === REAL_HOME || file.startsWith(REAL_HOME + path.sep)
+    ? "~" + file.slice(REAL_HOME.length)
+    : file;
+}
 
 export function paseoHome(): string {
   const configured = process.env.PASEO_HOME?.trim();

@@ -6,7 +6,9 @@ import {
   REAL_GEMINI,
   REAL_HOME,
   REAL_SETTINGS_FILE,
+  RECOVERY_DIR,
   SHARED_CLI_DIRS,
+  displayPath,
   profileCliDir,
   profileHome,
   profileRoot,
@@ -150,9 +152,166 @@ export function ensureProfile(accountId: string): Promise<string> {
   return withLock(accountId, () => syncProfile(accountId));
 }
 
-/** Deletes a profile. Symlinks are removed without touching what they point at. */
-export function removeProfile(accountId: string): Promise<void> {
-  return withLock(accountId, () => fs.rm(profileRoot(accountId), { recursive: true, force: true }));
+/** Entries of `dir` when it is a real directory. Never follows a symlink into the real home. */
+async function realEntries(dir: string): Promise<Dirent[]> {
+  const stat = await fs.lstat(dir).catch(() => null);
+  return stat?.isDirectory() ? readDirSafe(dir) : [];
+}
+
+/** True when a file, or a folder with at least one file or link somewhere inside. */
+async function holdsData(full: string, entry: Dirent): Promise<boolean> {
+  if (!entry.isDirectory()) return entry.isFile() || entry.isSymbolicLink();
+  for (const child of await readDirSafe(full)) {
+    if (await holdsData(path.join(full, child.name), child)) return true;
+  }
+  return false;
+}
+
+/**
+ * What agents saved in a profile's HOME, relative to it: entries that are not links to the real
+ * home, outside agy's own data folder for the account. Empty folders are left out.
+ */
+export async function savedFiles(accountId: string): Promise<string[]> {
+  const home = profileHome(accountId);
+  const found: string[] = [];
+  const collect = async (dir: string, skip: string) => {
+    for (const entry of await realEntries(dir)) {
+      if (entry.isSymbolicLink() || entry.name === skip) continue;
+      const full = path.join(dir, entry.name);
+      if (await holdsData(full, entry)) found.push(path.relative(home, full));
+    }
+  };
+  await collect(home, ".gemini");
+  await collect(path.join(home, ".gemini"), "antigravity-cli");
+  return found.sort((a, b) => a.localeCompare(b));
+}
+
+/** A folder name made from an account label. */
+function folderName(label: string): string {
+  const name = label
+    .replace(/[\u0000-\u001f\u007f/\\:*?"<>|]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^\.+/, "")
+    .slice(0, 60)
+    .trim();
+  return name || "Account";
+}
+
+function candidate(name: string, attempt: number): string {
+  return path.join(RECOVERY_DIR, attempt === 1 ? name : `${name} ${attempt}`);
+}
+
+/** The folder a removal would move saved files to, without creating it. */
+export async function recoveryFolder(label: string): Promise<string> {
+  const name = folderName(label);
+  for (let attempt = 1; ; attempt++) {
+    const folder = candidate(name, attempt);
+    if (!(await fs.lstat(folder).catch(() => null))) return folder;
+  }
+}
+
+/** Creates and returns a new, empty recovery folder for an account. */
+async function claimRecoveryFolder(label: string): Promise<string> {
+  await fs.mkdir(RECOVERY_DIR, { recursive: true });
+  const name = folderName(label);
+  for (let attempt = 1; ; attempt++) {
+    const folder = candidate(name, attempt);
+    try {
+      await fs.mkdir(folder);
+      return folder;
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST") throw error;
+    }
+  }
+}
+
+/** `destination`, or the first free "name 2.ext", "name 3.ext" beside it. */
+async function freePath(destination: string): Promise<string> {
+  const { dir, name, ext } = path.parse(destination);
+  for (let attempt = 1; ; attempt++) {
+    const candidate = attempt === 1 ? destination : path.join(dir, `${name} ${attempt}${ext}`);
+    if (!(await fs.lstat(candidate).catch(() => null))) return candidate;
+  }
+}
+
+/** Moves a file or folder without replacing anything, copying when it crosses to another volume. */
+async function move(source: string, destination: string): Promise<void> {
+  await fs.mkdir(path.dirname(destination), { recursive: true });
+  const target = await freePath(destination);
+  try {
+    await fs.rename(source, target);
+  } catch (error) {
+    if (errorCode(error) !== "EXDEV") throw error;
+    await fs.cp(source, target, {
+      recursive: true,
+      errorOnExist: true,
+      force: false,
+      preserveTimestamps: true,
+      verbatimSymlinks: true,
+      // Sockets and pipes cannot be copied and hold nothing worth keeping.
+      filter: async (file) => {
+        const stat = await fs.lstat(file);
+        return stat.isFile() || stat.isDirectory() || stat.isSymbolicLink();
+      },
+    });
+    await fs.rm(source, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Deletes what is left of a profile once its saved files are out: links into the real home,
+ * sockets and other special files, and empty folders. Never deletes a regular file, so a file
+ * written after the scan stays where it is. True when the whole folder is gone.
+ */
+async function clearProfile(dir: string): Promise<boolean> {
+  for (const entry of await readDirSafe(dir)) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) await clearProfile(full);
+    else if (!entry.isFile()) await fs.unlink(full).catch(() => undefined);
+  }
+  return fs.rmdir(dir).then(
+    () => true,
+    (error: unknown) => errorCode(error) === "ENOENT",
+  );
+}
+
+export interface PreservedFiles {
+  /** Absolute path of the folder the saved files were moved to. */
+  folder: string;
+  /** The moved entries, relative to the profile HOME (and to `folder`). */
+  items: string[];
+}
+
+/**
+ * Deletes a profile. Files agents saved in its HOME are first moved to a new folder under
+ * RECOVERY_DIR, then agy's data for the account, its sign-in included, is deleted. A failed move
+ * stops the removal, and agy's data is deleted only after every file found was moved. Nothing
+ * outside agy's data is deleted recursively; symlinks go without touching what they point at.
+ */
+export function removeProfile(accountId: string, label: string): Promise<PreservedFiles | null> {
+  return withLock(accountId, async () => {
+    const home = profileHome(accountId);
+    let folder: string | null = null;
+    const moved: string[] = [];
+    const movedSoFar = () => (folder ? ` Files moved so far are in ${displayPath(folder)}.` : "");
+    // A running agent can still write while this runs: whatever appears is moved on the next pass.
+    for (let pass = 1; pass <= 3; pass++) {
+      for (const item of await savedFiles(accountId)) {
+        folder ??= await claimRecoveryFolder(label);
+        try {
+          await move(path.join(home, item), path.join(folder, item));
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new Error(`Couldn't move ${item} out of the account's home folder: ${reason}.${movedSoFar()}`);
+        }
+        if (!moved.includes(item)) moved.push(item);
+      }
+      if (pass === 1) await fs.rm(profileCliDir(accountId), { recursive: true, force: true });
+      if (await clearProfile(profileRoot(accountId))) return folder ? { folder, items: moved } : null;
+    }
+    throw new Error(`Files keep appearing in the account's home folder. Stop its agents and remove it again.${movedSoFar()}`);
+  });
 }
 
 interface ScanOptions {

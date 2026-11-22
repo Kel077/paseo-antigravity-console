@@ -150,14 +150,35 @@ export const setDefaultAccountRpc = defineRpc({
   output: accountsStateSchema,
 });
 
+/** The folder in the daemon user's home that receives a removed account's saved files. */
+export const RECOVERY_FOLDER_NAME = "Antigravity Console";
+
+/** Files agents saved in a profile account's home folder, and where removing the account puts them. */
+export const savedFilesSchema = z.object({
+  /** Files and folders, relative to the account's home folder. */
+  items: z.array(z.string()),
+  /** The folder they are (or would be) moved to, with the home folder written as `~`. */
+  folder: z.string(),
+});
+export type SavedFiles = z.infer<typeof savedFilesSchema>;
+
+/** Lists what removing a profile account would move out of its home folder. */
+export const savedFilesRpc = defineRpc({
+  name: "accounts.saved-files",
+  input: z.object({ accountId: accountIdSchema }).strict(),
+  output: savedFilesSchema,
+});
+
 /**
- * Deletes a profile account and its stored sign-in. Shared conversations are kept.
- * Fails for the system account. Agents still pointing at it fail to open until switched.
+ * Deletes a profile account, its sign-in and agy's data for it. Files agents saved in its home
+ * folder are moved to a folder under ~/Antigravity Console first (`moved`, null when there were
+ * none). Shared conversations are kept. Fails for the system account. Agents still pointing at it
+ * fail to open until switched.
  */
 export const removeAccountRpc = defineRpc({
   name: "accounts.remove",
   input: z.object({ accountId: accountIdSchema }).strict(),
-  output: accountsStateSchema,
+  output: z.object({ state: accountsStateSchema, moved: savedFilesSchema.nullable() }),
 });
 
 /** Deletes a profile account's stored sign-in but keeps the account. Fails for the system account. */

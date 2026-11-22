@@ -21,6 +21,7 @@ To add an account, open Antigravity Console from the Command Center or the sideb
 ## Data and access
 
 - Each added account runs agy with its own HOME inside Paseo's plugin data folder. That HOME links back to your real home, so agents still see your files and settings, and agy keeps only that account's sign-in there, as a file instead of a keychain entry. Conversations are shared by all accounts. If a sign-in ever lands outside its profile, the plugin stops using that account.
+- Removing an added account deletes its sign-in and the data agy keeps for it, such as logs and caches. Files agents saved in its home folder are first moved to `~/Antigravity Console/<account name>`, and the Remove dialog lists them before you confirm.
 - Before each launch on an added account, the plugin copies agy's `settings.json` into that account's profile, so every account uses the same preferences.
 - Choosing a planner or executor writes the `orchestrator` entry of `~/.gemini/antigravity-cli/settings.json`.
 - Quota, model lists and sign-in run the agy CLI on the daemon host. Usage, context and subagent views read agy's conversation records and logs under `~/.gemini/antigravity-cli`.
@@ -30,5 +31,5 @@ To add an account, open Antigravity Console from the Command Center or the sideb
 
 - The model picker lists the system sign-in's models, and accounts can offer different ones. An agent moved to an account without its model fails to start there and stays on its current account.
 - A planner or executor that an account cannot run falls back to agy's default on that account.
-- Files an agent creates directly in the home folder while it runs on an added account land in that account's profile.
+- Files an agent creates directly in the home folder while it runs on an added account stay in that account's profile until you remove the account.
 - The subagent views are read-only. Stopping or messaging a subagent stays with its parent agent.
