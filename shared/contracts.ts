@@ -88,6 +88,15 @@ export type AccountSummary = z.infer<typeof accountSummarySchema>;
 export type QuotaGroup = z.infer<typeof quotaGroupSchema>;
 export type QuotaBucket = z.infer<typeof quotaBucketSchema>;
 
+/** Automatic account fallback when an Antigravity turn fails. */
+export const fallbackSettingsSchema = z.object({
+  enabled: z.boolean(),
+  /** Retries on the same account for errors that may pass (network, 5xx, unknown) before moving on. */
+  retries: z.number().int().min(0).max(3),
+});
+
+export type FallbackSettings = z.infer<typeof fallbackSettingsSchema>;
+
 export const accountsStateSchema = z.object({
   /** System account first, then profile accounts in creation order. */
   accounts: z.array(accountSummarySchema),
@@ -97,6 +106,7 @@ export const accountsStateSchema = z.object({
   agyVersion: z.string().nullable(),
   /** Host-level problems to show above the list, for example "agy was not found". */
   problems: z.array(z.string()),
+  fallback: fallbackSettingsSchema,
   /** Increases on every change; clients can compare it with the watch event. */
   revision: z.number().int().nonnegative(),
 });
@@ -286,3 +296,25 @@ export const usageStatsRpc = defineRpc({
   input: z.object({ range: statsRangeSchema }).strict(),
   output: usageStatsSchema,
 });
+
+export const setFallbackRpc = defineRpc({
+  name: "accounts.set-fallback",
+  input: fallbackSettingsSchema.partial().strict(),
+  output: accountsStateSchema,
+});
+
+/** Timeline row the plugin appends when it retries or moves an agent to another account. */
+export const FALLBACK_TIMELINE_KIND = "antigravity-fallback";
+
+export const fallbackEventSchema = z.object({
+  event: z.enum(["retry", "switch", "exhausted"]),
+  /** quota: limit reached; auth: sign-in rejected; transient: may pass; error: anything else. */
+  reason: z.enum(["quota", "auth", "transient", "error"]),
+  from: z.string(),
+  to: z.string().nullable(),
+  attempt: z.number().int().nonnegative(),
+  retries: z.number().int().nonnegative(),
+  message: z.string().max(400),
+});
+
+export type FallbackEvent = z.infer<typeof fallbackEventSchema>;

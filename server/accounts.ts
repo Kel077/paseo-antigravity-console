@@ -2,12 +2,13 @@ import {
   SYSTEM_ACCOUNT_ID,
   type AccountSummary,
   type AccountsState,
+  type FallbackSettings,
   type QuotaGroup,
 } from "../shared/contracts";
 import { agyVersion, probeAccount, readAccountEmail } from "./agy";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { dataDir, resolveAgy } from "./paths";
+import { dataDir, profileHome, resolveAgy } from "./paths";
 
 const statusFile = () => path.join(dataDir(), "status.json");
 import { deleteSignIn, ensureProfile, removeProfile, scanAfterSignIn } from "./profile";
@@ -245,8 +246,36 @@ export class AccountService {
       agyPath: agy,
       agyVersion: this.agyVersionValue,
       problems,
+      fallback: data.fallback,
       revision: this.revision,
     };
+  }
+
+  fallbackSettings(): FallbackSettings {
+    return this.store.snapshot().fallback;
+  }
+
+  async setFallback(patch: Partial<FallbackSettings>): Promise<void> {
+    await this.store.update((data) => {
+      data.fallback = { ...data.fallback, ...patch };
+    });
+    this.changed();
+  }
+
+  /** Whether the sign-in file agy wrote for a profile account is still there (true when none was recorded). */
+  async hasSignInFile(accountId: string): Promise<boolean> {
+    const account = this.store.get(accountId);
+    const recorded = account?.credentialFiles.find((file) => /oauth-token|token\.json|auth/i.test(file));
+    if (!recorded) return true;
+    return fs
+      .stat(path.join(profileHome(accountId), recorded))
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  /** Last known quota groups, without probing. */
+  knownQuota(accountId: string): QuotaGroup[] | null {
+    return this.runtime.get(accountId)?.quota ?? null;
   }
 
   async create(label: string): Promise<AccountSummary> {

@@ -5,6 +5,7 @@ import {
   SYSTEM_ACCOUNT_ID,
   accountIdFromMetadata,
   isAntigravityProvider,
+  type FallbackEvent,
 } from "../shared/contracts";
 import type { AccountService } from "./accounts";
 import { sessionEnv } from "./agy";
@@ -96,10 +97,17 @@ export async function switchAgentAccount(
   return { result: "switched", accountLabel };
 }
 
+/** The fallback controller's part of the session-open path; kept as an interface to avoid an import cycle. */
+export interface OpenFallback {
+  healthOf(accountId: string): Promise<FallbackEvent["reason"] | null>;
+  redirectForOpen(paseo: PaseoApi, agentId: string, accountId: string, reason: FallbackEvent["reason"], record: boolean): Promise<string | null>;
+}
+
 export function registerHooks(
   server: PluginServerContext,
   service: AccountService,
   pending: PendingSwitches,
+  fallback?: OpenFallback,
 ): Array<() => void> {
   const removers: Array<() => void> = [];
 
@@ -128,10 +136,18 @@ export function registerHooks(
 
   // Every launch of an Antigravity session gets the environment of its account.
   removers.push(
-    server.addHook("agent.open.before", async ({ request }) => {
+    server.addHook("agent.open.before", async ({ request }, { paseo }) => {
       if (!isAntigravityProvider(request.provider)) return undefined;
       await service.init();
       let accountId = accountIdFromMetadata(request.metadata);
+      // Fallback: an account known to be unable to serve gives way to the next one that can.
+      if (service.fallbackSettings().enabled && fallback) {
+        const reason = await fallback.healthOf(accountId);
+        if (reason) {
+          const next = await fallback.redirectForOpen(paseo, request.agentId, accountId, reason, request.purpose === "interactive");
+          if (next) accountId = next;
+        }
+      }
       const account = accountId === SYSTEM_ACCOUNT_ID ? null : service.store.get(accountId);
       if (accountId !== SYSTEM_ACCOUNT_ID) {
         const problem = !account

@@ -22,6 +22,9 @@ const storeSchema = z.object({
   systemLabel: z.string().default("System sign-in"),
   systemEmail: z.string().nullable().default(null),
   accounts: z.array(storedAccountSchema).default([]),
+  fallback: z
+    .object({ enabled: z.boolean().default(true), retries: z.number().int().min(0).max(3).default(2) })
+    .default({ enabled: true, retries: 2 }),
 });
 
 export type StoredAccount = z.infer<typeof storedAccountSchema>;

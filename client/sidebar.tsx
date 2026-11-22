@@ -83,7 +83,7 @@ export function QuotaSidebarItem({ theme, currentScreen, openScreen }: PluginSid
     >
       <Icon icon={{ svg: antigravityLogo }} size={ICON_SIZE} color={colors.foregroundMuted} />
       <Meter colors={colors} label="5H" bucket={fiveHour} locale={locale} />
-      <Meter colors={colors} label="W" bucket={weekly} locale={locale} />
+      <Meter colors={colors} label="7D" bucket={weekly} locale={locale} />
     </Pressable>
   );
 }

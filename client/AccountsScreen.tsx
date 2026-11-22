@@ -1,5 +1,5 @@
 import { useRpc, useTranslation, type PluginSurfaceProps } from "@getpaseo/plugin/client";
-import { Icon, ScrollView, SettingsCard, SettingsRow, SettingsSelect, useToast } from "@getpaseo/plugin/client/ui";
+import { Icon, ScrollView, SettingsCard, SettingsRow, SettingsSelect, SettingsSwitch, useToast } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { ActivityIndicator, Text, View } from "react-native";
 import {
@@ -8,6 +8,7 @@ import {
   removeAccountRpc,
   renameAccountRpc,
   setDefaultAccountRpc,
+  setFallbackRpc,
   signOutAccountRpc,
   type AccountSummary,
 } from "../shared/contracts";
@@ -84,6 +85,7 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
   const rename = useRpc(renameAccountRpc);
   const remove = useRpc(removeAccountRpc);
   const setDefault = useRpc(setDefaultAccountRpc);
+  const setFallback = useRpc(setFallbackRpc);
   const signOut = useRpc(signOutAccountRpc);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [busy, setBusy] = useState<Record<string, CardAction | null>>({});
@@ -235,6 +237,29 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
                   options={data.accounts.filter((account) => account.usable).map((account) => ({ value: account.id, label: displayLabel(account.label, t) }))}
                   onValueChange={(accountId) => {
                     void setDefault({ accountId })
+                      .then(accept)
+                      .catch((reason: unknown) => toast.error(errorMessage(reason)));
+                  }}
+                />
+                <SettingsSwitch
+                  label={t("settings.fallback")}
+                  value={data.fallback.enabled}
+                  onValueChange={(enabled) => {
+                    void setFallback({ enabled })
+                      .then(accept)
+                      .catch((reason: unknown) => toast.error(errorMessage(reason)));
+                  }}
+                />
+                <SettingsSelect
+                  label={t("settings.retries")}
+                  disabled={!data.fallback.enabled}
+                  value={String(data.fallback.retries)}
+                  options={[0, 1, 2, 3].map((count) => ({
+                    value: String(count),
+                    label: count === 0 ? t("settings.retryNone") : t("settings.retryCount", { count }),
+                  }))}
+                  onValueChange={(value) => {
+                    void setFallback({ retries: Number(value) })
                       .then(accept)
                       .catch((reason: unknown) => toast.error(errorMessage(reason)));
                   }}

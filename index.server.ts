@@ -7,6 +7,7 @@ import {
   refreshAccountsRpc,
   removeAccountRpc,
   renameAccountRpc,
+  setFallbackRpc,
   setDefaultAccountRpc,
   signOutAccountRpc,
   startSignInRpc,
@@ -17,6 +18,7 @@ import {
 } from "./shared/contracts";
 import { AccountService } from "./server/accounts";
 import { ContextReader } from "./server/context";
+import { FallbackController } from "./server/fallback";
 import { UsageStatsReader } from "./server/stats";
 import { PendingSwitches, registerHooks, switchAgentAccount } from "./server/hooks";
 import { createUsageSource } from "./server/usage";
@@ -48,7 +50,9 @@ export default function contribute(server: PluginServerContext) {
     void ready.then(() => service.refreshAll()).catch(() => undefined);
   }, 15 * 60_000);
 
-  const removers = registerHooks(server, service, pending);
+  const fallback = new FallbackController(service, pending);
+  const removers = registerHooks(server, service, pending, fallback);
+  removers.push(fallback.register(server));
   server.registerUsageSource(createUsageSource(service));
 
   server.handle(listAccountsRpc, async ({ refresh }) => {
@@ -77,6 +81,12 @@ export default function contribute(server: PluginServerContext) {
   server.handle(renameAccountRpc, async ({ accountId, label }) => {
     await ready;
     await service.rename(accountId, label);
+    return service.state();
+  });
+
+  server.handle(setFallbackRpc, async (patch) => {
+    await ready;
+    await service.setFallback(patch);
     return service.state();
   });
 
@@ -137,6 +147,7 @@ export default function contribute(server: PluginServerContext) {
     clearInterval(quotaTimer);
     clearInterval(sweepTimer);
     for (const remove of removers) remove();
+    fallback.dispose();
     service.dispose();
   };
 }

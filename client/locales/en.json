@@ -164,5 +164,23 @@
   },
   "sidebar": {
     "label": "Antigravity: {{fiveHour}} of the 5-hour quota and {{weekly}} of the weekly quota left"
+  },
+  "settings": {
+    "fallback": "Switch account on errors",
+    "retries": "Retries before switching",
+    "retryNone": "None",
+    "retryCount_one": "{{count}} retry",
+    "retryCount_other": "{{count}} retries"
+  },
+  "fallback": {
+    "switch": "{{from}}: {{reason}}. Switched to {{to}} and continued.",
+    "retry": "{{from}} failed. Retrying ({{attempt}}/{{retries}}).",
+    "exhausted": "No Antigravity account can take over. Automatic switching stopped.",
+    "reason": {
+      "quota": "quota used up",
+      "auth": "sign-in rejected",
+      "transient": "repeated errors",
+      "error": "repeated errors"
+    }
   }
 }

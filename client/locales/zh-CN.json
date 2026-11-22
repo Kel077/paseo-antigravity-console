@@ -161,5 +161,22 @@
   },
   "sidebar": {
     "label": "Antigravity：5 小时额度剩余 {{fiveHour}}，每周额度剩余 {{weekly}}"
+  },
+  "settings": {
+    "fallback": "出错时自动切换账号",
+    "retries": "切换前重试",
+    "retryNone": "不重试",
+    "retryCount_other": "{{count}} 次"
+  },
+  "fallback": {
+    "switch": "「{{from}}」{{reason}}，已切换到「{{to}}」继续",
+    "retry": "「{{from}}」出错，正在重试（{{attempt}}/{{retries}}）",
+    "exhausted": "没有可接手的 Antigravity 账号，已停止自动切换",
+    "reason": {
+      "quota": "额度用完",
+      "auth": "登录失效",
+      "transient": "连续出错",
+      "error": "连续出错"
+    }
   }
 }

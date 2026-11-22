@@ -5,6 +5,8 @@ import { ComposerAccount } from "./client/composer";
 import { antigravityLogo } from "./client/logo";
 import { messages } from "./client/messages";
 import { QuotaSidebarItem } from "./client/sidebar";
+import { FallbackNote } from "./client/timeline";
+import { FALLBACK_TIMELINE_KIND, fallbackEventSchema } from "./shared/contracts";
 
 const logo = { svg: antigravityLogo };
 
@@ -30,6 +32,7 @@ export default function contribute(client: PluginClientContext) {
     client.addCommandCenterItem({ id: "accounts", title, icon: logo, context: "global",
       onSelect: ({ openScreen }) => openScreen({ screenId: "accounts" }) }),
     client.addComposerItem({ id: "account", Component: Composer }),
+    client.addTimelineRenderer({ kind: FALLBACK_TIMELINE_KIND, version: 1, schema: fallbackEventSchema, Component: FallbackNote }),
   ];
   return () => {
     observation.stop();
