@@ -112,6 +112,8 @@ export async function readConversationUsage(
 interface AgentInfo {
   conversationId: string | null;
   model: string | null;
+  /** The provider process is not running (closed or failed). */
+  closed: boolean;
   native: boolean;
   antigravity: boolean;
   fetchedAt: number;
@@ -152,6 +154,7 @@ export class ContextReader {
     const info: AgentInfo = {
       conversationId: conversationIdFrom(agent.persistence),
       model: agent.model ?? null,
+      closed: agent.status === "closed" || agent.status === "error",
       native: typeof agent.lastUsage?.contextWindowMaxTokens === "number",
       antigravity: isAntigravityProvider(agent.provider),
       fetchedAt: Date.now(),
@@ -180,6 +183,16 @@ export class ContextReader {
       }),
     );
     return { usage, native };
+  }
+
+  /** The agy conversation an Antigravity agent runs, or null for other agents. */
+  async conversationOf(
+    paseo: PaseoApi,
+    agentId: string,
+  ): Promise<{ conversationId: string | null; closed: boolean } | null> {
+    const info = await this.info(paseo, agentId);
+    if (!info?.antigravity) return null;
+    return { conversationId: info.conversationId, closed: info.closed };
   }
 
   forget(agentId: string): void {

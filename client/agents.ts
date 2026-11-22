@@ -10,18 +10,25 @@ import { useEffect } from "react";
 import {
   accountIdFromMetadata,
   contextUsageRpc,
+  getOrchestratorRpc,
   isAntigravityProvider,
+  isOrchestratorModel,
   listAccountsRpc,
+  setOrchestratorRpc,
+  subagentCountsRpc,
   switchAgentAccountRpc,
   watchAccountsSubscription,
   type AccountsState,
   type AccountSummary,
   type ContextUsage,
+  type ModelFamily,
+  type OrchestratorState,
 } from "../shared/contracts";
 import { ContextPopover, contextStore } from "./context";
 import { percent, tokens } from "./format";
 import { displayLabel } from "./labels";
-import { messages } from "./messages";
+import { errorMessage, messages } from "./messages";
+import { shortModelLabel } from "./orchestrator";
 
 type AgentRow = {
   id: string;
@@ -29,19 +36,28 @@ type AgentRow = {
   archivedAt?: unknown;
   metadata?: Readonly<Record<string, unknown>> | null;
   provider: string;
+  model?: string | null;
   status: string;
 };
-type Member = { id: string; workspace: string | null; account: string; running: boolean };
+type Member = { id: string; workspace: string | null; account: string; running: boolean; model: string | null };
+type OpenSubagents = (agentId: string, workspaceId: string | null | undefined, subagentId?: string) => void;
+
+/** An empty icon that keeps menu labels aligned with the checked one. */
+const BLANK_ICON = { svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M0 0h24v24H0z" fill="none"/></svg>' };
 type Counts = ReadonlyMap<string, number>;
 type Timer = ReturnType<typeof setTimeout>;
 
 const CONTEXT_POLL_MS = 5000;
 
-export function observeAgents(client: PluginClientContext) {
+export function observeAgents(client: PluginClientContext, openSubagents: OpenSubagents) {
   const lifetime = new AbortController();
   const agents = new Map<string, Member>();
   const accountPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const contextPills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const subagentPills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const orchestratorPills = new Map<string, PluginButtonRegistration<PluginText>>();
+  const subagentCounts = new Map<string, { total: number; running: number }>();
+  let orchestrator: OrchestratorState | undefined;
   const nativeContext = new Set<string>();
   const listeners = new Set<() => void>();
   const presenters = new Map<symbol, ToastApi>();
@@ -168,19 +184,183 @@ export function observeAgents(client: PluginClientContext) {
     }
   }
 
+  // ---- Subagent pill ------------------------------------------------------------------------
+
+  function renderSubagentPill(agent: Member) {
+    const count = subagentCounts.get(agent.id);
+    if (!agent.workspace || !count?.total) {
+      subagentPills.get(agent.id)?.remove();
+      subagentPills.delete(agent.id);
+      return;
+    }
+    const label = count.running
+      ? messages.message("subagents.pillLabel", { running: count.running, total: count.total })
+      : messages.message("subagents.pillLabelIdle", { total: count.total });
+    const pill = subagentPills.get(agent.id);
+    if (pill) {
+      pill.update({ label });
+      return;
+    }
+    const workspace = agent.workspace;
+    subagentPills.set(
+      agent.id,
+      client.addComposerPill({
+        id: "subagents",
+        agentId: agent.id,
+        workspaceId: workspace,
+        button: {
+          icon: "Bot",
+          title: messages.message("subagents.pill"),
+          label,
+          behavior: { kind: "action", onPress: () => openSubagents(agent.id, workspace) },
+        },
+      }),
+    );
+  }
+
+  // ---- Orchestrator pill --------------------------------------------------------------------
+
+  async function chooseOrchestrator(agent: Member, patch: { planner?: string | null; executor?: string | null }) {
+    try {
+      const { state, applied } = await client.rpc(setOrchestratorRpc, { ...patch, applyTo: agent.id });
+      orchestrator = state;
+      agents.forEach(renderOrchestratorPill);
+      notify(client.i18n.t(messages, `orchestrator.applied.${applied}`));
+    } catch (error) {
+      notify(errorMessage(error));
+    }
+  }
+
+  function roleMenu(
+    agent: Member,
+    role: "planner" | "executor",
+    families: readonly ModelFamily[],
+    saved: string | null,
+  ): PluginButtonMenuEntry<PluginText>[] {
+    const entries: PluginButtonMenuEntry<PluginText>[] = families.map((family) => {
+      const choose = (label: string) => ({ kind: "action" as const, onPress: () => chooseOrchestrator(agent, { [role]: label }) });
+      const chosen = family.variants.some((variant) => variant.label === saved);
+      const missing = !family.accounts.includes(agent.account);
+      if (family.variants.length === 1) {
+        const only = family.variants[0]!;
+        return { kind: "item", id: family.id, title: only.label, icon: chosen ? "Check" : BLANK_ICON, disabled: missing, behavior: choose(only.label) };
+      }
+      return {
+        kind: "item",
+        id: family.id,
+        title: family.label,
+        icon: chosen ? "Check" : BLANK_ICON,
+        disabled: missing,
+        behavior: {
+          kind: "menu",
+          items: family.variants.map((variant) => ({
+            kind: "item" as const,
+            id: variant.id,
+            title: variant.effort || variant.label,
+            icon: variant.label === saved ? "Check" : BLANK_ICON,
+            behavior: choose(variant.label),
+          })),
+        },
+      };
+    });
+    entries.push({ kind: "separator", id: `${role}-separator` });
+    entries.push({
+      kind: "item",
+      id: `${role}-default`,
+      title: messages.message("orchestrator.default"),
+      icon: saved ? BLANK_ICON : "Check",
+      behavior: { kind: "action", onPress: () => chooseOrchestrator(agent, { [role]: null }) },
+    });
+    return entries;
+  }
+
+  function renderOrchestratorPill(agent: Member) {
+    if (!agent.workspace || !isOrchestratorModel(agent.model) || !orchestrator) {
+      orchestratorPills.get(agent.id)?.remove();
+      orchestratorPills.delete(agent.id);
+      return;
+    }
+    const state = orchestrator;
+    const plannerFamily = state.planners.find((family) => family.variants.some((variant) => variant.label === state.planner));
+    // A planner this account cannot run falls back to agy's default.
+    const effective = plannerFamily && plannerFamily.accounts.includes(agent.account) ? state.planner : null;
+    const button: PluginButton<PluginText> = {
+      icon: "Workflow",
+      title: messages.message("orchestrator.pillTitle"),
+      label: effective ? shortModelLabel(effective) : messages.message("orchestrator.pillDefault"),
+      behavior: {
+        kind: "menu",
+        items: [
+          {
+            kind: "item",
+            id: "planner",
+            title: messages.message("orchestrator.planner"),
+            icon: "Sparkles",
+            behavior: { kind: "menu", items: roleMenu(agent, "planner", state.planners, state.planner) },
+          },
+          {
+            kind: "item",
+            id: "executor",
+            title: messages.message("orchestrator.executor"),
+            icon: "Cpu",
+            behavior: { kind: "menu", items: roleMenu(agent, "executor", state.executors, state.executor) },
+          },
+          { kind: "separator", id: "separator" },
+          {
+            kind: "item",
+            id: "manage",
+            title: messages.message("orchestrator.manage"),
+            icon: "Settings2",
+            behavior: { kind: "action", onPress: () => client.openScreen({ screenId: "accounts" }) },
+          },
+        ],
+      },
+    };
+    const pill = orchestratorPills.get(agent.id);
+    if (pill) pill.update(button);
+    else {
+      orchestratorPills.set(
+        agent.id,
+        client.addComposerPill({ id: "orchestrator", agentId: agent.id, workspaceId: agent.workspace, button }),
+      );
+    }
+  }
+
+  async function readOrchestrator() {
+    try {
+      orchestrator = await client.rpc(getOrchestratorRpc, {});
+      agents.forEach(renderOrchestratorPill);
+    } catch (error) {
+      if (!lifetime.signal.aborted) console.warn("[antigravity-accounts] orchestrator settings unavailable", error);
+    }
+  }
+  void readOrchestrator();
+  const orchestratorTimer = setInterval(() => void readOrchestrator(), 10 * 60_000);
+
   let polling = false;
   async function pollContext() {
     const ids = [...agents.values()].filter((agent) => agent.workspace).map((agent) => agent.id);
     if (polling || lifetime.signal.aborted || ids.length === 0) return;
     polling = true;
     try {
-      const { usage, native } = await client.rpc(contextUsageRpc, { agentIds: ids });
+      const [{ usage, native }, { counts: found }] = await Promise.all([
+        client.rpc(contextUsageRpc, { agentIds: ids }),
+        client.rpc(subagentCountsRpc, { agentIds: ids }).catch(() => ({ counts: {} as Record<string, { total: number; running: number }> })),
+      ]);
       nativeContext.clear();
       for (const id of native) nativeContext.add(id);
       for (const id of ids) contextStore.set(id, usage[id] ?? null);
       for (const id of ids) {
+        const count = found[id];
+        if (count) subagentCounts.set(id, count);
+        else subagentCounts.delete(id);
+      }
+      for (const id of ids) {
         const agent = agents.get(id);
-        if (agent) renderContextPill(agent);
+        if (agent) {
+          renderContextPill(agent);
+          renderSubagentPill(agent);
+        }
       }
     } catch (error) {
       if (!lifetime.signal.aborted) console.warn("[antigravity-accounts] context refresh failed", error);
@@ -240,6 +420,11 @@ export function observeAgents(client: PluginClientContext) {
     accountPills.delete(id);
     contextPills.get(id)?.remove();
     contextPills.delete(id);
+    subagentPills.get(id)?.remove();
+    subagentPills.delete(id);
+    orchestratorPills.get(id)?.remove();
+    orchestratorPills.delete(id);
+    subagentCounts.delete(id);
     contextStore.delete(id);
     agents.delete(id);
   }
@@ -250,15 +435,26 @@ export function observeAgents(client: PluginClientContext) {
       workspace: row.workspaceId ?? null,
       account: accountIdFromMetadata(row.metadata),
       running: row.status === "running" || row.status === "initializing",
+      model: row.model ?? null,
     };
     const old = agents.get(row.id);
     // A status change usually means a turn started or ended: context changes then.
     if (!old || old.running !== member.running) pollSoon();
-    if (old && old.workspace === member.workspace && old.account === member.account && old.running === member.running) return;
+    if (
+      old &&
+      old.workspace === member.workspace &&
+      old.account === member.account &&
+      old.running === member.running &&
+      old.model === member.model
+    ) {
+      return;
+    }
     if (old && old.workspace !== member.workspace) remove(row.id);
     agents.set(row.id, member);
     renderAccountPill(member);
     renderContextPill(member);
+    renderSubagentPill(member);
+    renderOrchestratorPill(member);
   }
   let reconnect: Timer | undefined;
   async function observe() {
@@ -334,17 +530,28 @@ export function observeAgents(client: PluginClientContext) {
       };
     },
     refreshContext: () => pollContext(),
+    /** Settings changed elsewhere (the console screen): redraw the Orchestrator pills. */
+    setOrchestrator(state: OrchestratorState) {
+      orchestrator = state;
+      agents.forEach(renderOrchestratorPill);
+    },
     stop() {
       lifetime.abort();
       clearTimeout(retry);
       clearTimeout(reconnect);
       clearTimeout(soon);
       clearInterval(contextTimer);
+      clearInterval(orchestratorTimer);
       slash();
       accountPills.forEach((pill) => pill.remove());
       contextPills.forEach((pill) => pill.remove());
+      subagentPills.forEach((pill) => pill.remove());
+      orchestratorPills.forEach((pill) => pill.remove());
       accountPills.clear();
       contextPills.clear();
+      subagentPills.clear();
+      orchestratorPills.clear();
+      subagentCounts.clear();
       agents.clear();
       listeners.clear();
       presenters.clear();

@@ -5,6 +5,7 @@ import {
   REAL_CLI_DIR,
   REAL_GEMINI,
   REAL_HOME,
+  REAL_SETTINGS_FILE,
   SHARED_CLI_DIRS,
   profileCliDir,
   profileHome,
@@ -123,7 +124,25 @@ async function syncProfile(accountId: string): Promise<string> {
     await fs.mkdir(target, { recursive: true });
     await ensureLink(path.join(cli, name), target);
   }
+  await syncSettings(cli);
   return home;
+}
+
+/**
+ * Copies agy's settings.json into the profile, so every account runs with the same Orchestrator
+ * planner and executor and the same preferences. A copy, not a link: agy replaces the file when
+ * it saves, which would turn a link into a stale private copy.
+ */
+async function syncSettings(cli: string): Promise<void> {
+  const target = path.join(cli, "settings.json");
+  try {
+    await fs.copyFile(REAL_SETTINGS_FILE, target);
+    await fs.chmod(target, 0o600).catch(() => undefined);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+    // No settings of its own: a stale copy must not keep an old choice alive.
+    await fs.rm(target, { force: true });
+  }
 }
 
 /** Creates or refreshes an account's profile and returns its HOME. Safe to call concurrently. */

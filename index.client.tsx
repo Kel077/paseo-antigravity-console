@@ -5,13 +5,23 @@ import { ComposerAccount } from "./client/composer";
 import { antigravityLogo } from "./client/logo";
 import { messages } from "./client/messages";
 import { QuotaSidebarItem } from "./client/sidebar";
+import { SUBAGENT_PANEL_ID, createSubagentViews } from "./client/subagents";
 import { FallbackNote } from "./client/timeline";
-import { FALLBACK_TIMELINE_KIND, fallbackEventSchema } from "./shared/contracts";
+import { registerSubagentTransforms } from "./client/transform";
+import {
+  FALLBACK_TIMELINE_KIND,
+  SUBAGENT_LIST_TIMELINE_KIND,
+  SUBAGENT_TIMELINE_KIND,
+  fallbackEventSchema,
+  subagentCardSchema,
+  subagentCheckSchema,
+} from "./shared/contracts";
 
 const logo = { svg: antigravityLogo };
 
 export default function contribute(client: PluginClientContext) {
-  const observation = observeAgents(client);
+  const subagents = createSubagentViews(client);
+  const observation = observeAgents(client, subagents.open);
   const title = messages.message("title");
   function Screen(props: PluginSurfaceProps) {
     observation.useNotifications();
@@ -33,6 +43,15 @@ export default function contribute(client: PluginClientContext) {
       onSelect: ({ openScreen }) => openScreen({ screenId: "accounts" }) }),
     client.addComposerItem({ id: "account", Component: Composer }),
     client.addTimelineRenderer({ kind: FALLBACK_TIMELINE_KIND, version: 1, schema: fallbackEventSchema, Component: FallbackNote }),
+    client.addTimelineRenderer({ kind: SUBAGENT_TIMELINE_KIND, version: 1, schema: subagentCardSchema, Component: subagents.SubagentCardRow }),
+    client.addTimelineRenderer({ kind: SUBAGENT_LIST_TIMELINE_KIND, version: 1, schema: subagentCheckSchema, Component: subagents.SubagentCheckRow }),
+    registerSubagentTransforms(client),
+    client.addAgentPanel({
+      id: SUBAGENT_PANEL_ID,
+      title: messages.message("subagents.title"),
+      icon: "Bot",
+      Component: subagents.SubagentsPanel,
+    }),
   ];
   return () => {
     observation.stop();

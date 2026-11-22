@@ -18,6 +18,7 @@ import { ConfirmRemove, NameDialog } from "./dialogs";
 import { displayLabel } from "./labels";
 import { antigravityLogo } from "./logo";
 import { errorMessage, messages } from "./messages";
+import { OrchestratorRows } from "./orchestrator";
 import { SignIn } from "./signIn";
 import { UsageSection } from "./stats";
 import { font, radius, space, tint, type Colors } from "./theme";
@@ -264,6 +265,7 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
                       .catch((reason: unknown) => toast.error(errorMessage(reason)));
                   }}
                 />
+                <OrchestratorRows accounts={data.accounts} onChange={(state) => observation.setOrchestrator(state)} />
                 <SettingsRow label={t("overview.cli")} hint={data.agyPath ?? undefined}>
                   <Text style={{ ...font.small, color: data.agyPath ? colors.foreground : colors.statusWarning }}>
                     {data.agyPath ? t("overview.cliValue", { version: data.agyVersion ?? "?" }) : t("overview.cliMissing")}

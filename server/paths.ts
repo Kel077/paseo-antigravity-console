@@ -8,6 +8,8 @@ export const REAL_HOME = os.homedir();
 export const REAL_GEMINI = path.join(REAL_HOME, ".gemini");
 /** agy's default app-data directory (`--app-data-dir antigravity-cli`). */
 export const REAL_CLI_DIR = path.join(REAL_GEMINI, "antigravity-cli");
+/** agy's settings: default model, Orchestrator planner and executor, trusted folders and more. */
+export const REAL_SETTINGS_FILE = path.join(REAL_CLI_DIR, "settings.json");
 
 /**
  * Directories under antigravity-cli that hold conversation state. Every profile links these to the

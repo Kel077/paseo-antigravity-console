@@ -3,15 +3,20 @@ import {
   cancelSignInRpc,
   contextUsageRpc,
   createAccountRpc,
+  getOrchestratorRpc,
   listAccountsRpc,
+  listSubagentsRpc,
   refreshAccountsRpc,
   removeAccountRpc,
   renameAccountRpc,
   setFallbackRpc,
   setDefaultAccountRpc,
+  setOrchestratorRpc,
   signOutAccountRpc,
   startSignInRpc,
   submitSignInRpc,
+  subagentCountsRpc,
+  subagentDetailRpc,
   switchAgentAccountRpc,
   usageStatsRpc,
   watchAccountsSubscription,
@@ -19,6 +24,8 @@ import {
 import { AccountService } from "./server/accounts";
 import { ContextReader } from "./server/context";
 import { FallbackController } from "./server/fallback";
+import { OrchestratorSettings } from "./server/orchestrator";
+import { SubagentReader } from "./server/subagents";
 import { UsageStatsReader } from "./server/stats";
 import { PendingSwitches, registerHooks, switchAgentAccount } from "./server/hooks";
 import { createUsageSource } from "./server/usage";
@@ -28,6 +35,8 @@ export default function contribute(server: PluginServerContext) {
   const pending = new PendingSwitches();
   const context = new ContextReader();
   const stats = new UsageStatsReader();
+  const subagents = new SubagentReader(context);
+  const orchestrator = new OrchestratorSettings(service);
   const ready = service.init();
 
   // Learn every account's state once in the background so the composer can show it.
@@ -53,6 +62,7 @@ export default function contribute(server: PluginServerContext) {
   const fallback = new FallbackController(service, pending);
   const removers = registerHooks(server, service, pending, fallback);
   removers.push(fallback.register(server));
+  removers.push(...orchestrator.register(server));
   server.registerUsageSource(createUsageSource(service));
 
   server.handle(listAccountsRpc, async ({ refresh }) => {
@@ -132,6 +142,28 @@ export default function contribute(server: PluginServerContext) {
   server.handle(usageStatsRpc, async ({ range }) => stats.summary(range));
 
   server.handle(contextUsageRpc, async ({ agentIds }, { paseo }) => context.usage(paseo, agentIds));
+
+  server.handle(listSubagentsRpc, async ({ agentId }, { paseo }) => subagents.list(paseo, agentId));
+
+  server.handle(subagentCountsRpc, async ({ agentIds }, { paseo }) => ({
+    counts: await subagents.counts(paseo, agentIds),
+  }));
+
+  server.handle(subagentDetailRpc, async ({ agentId, subagentId }, { paseo }) =>
+    subagents.detail(paseo, agentId, subagentId),
+  );
+
+  server.handle(getOrchestratorRpc, async ({ refresh }) => {
+    await ready;
+    return orchestrator.state(refresh ?? false);
+  });
+
+  server.handle(setOrchestratorRpc, async ({ planner, executor, applyTo }, { paseo }) => {
+    await ready;
+    const state = await orchestrator.save({ planner, executor });
+    const applied = applyTo ? await orchestrator.apply(paseo, applyTo) : "none";
+    return { state, applied };
+  });
 
   // Must return synchronously: a returned promise closes the subscription when it settles.
   server.handle(watchAccountsSubscription, (_input, { push, signal }) => {

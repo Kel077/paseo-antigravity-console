@@ -1,0 +1,468 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import type { PaseoApi } from "@getpaseo/client";
+import type {
+  SubagentDetail,
+  SubagentList,
+  SubagentState,
+  SubagentSummary,
+  TranscriptEntry,
+} from "../shared/contracts";
+import type { ContextReader } from "./context";
+import { REAL_CLI_DIR } from "./paths";
+
+/**
+ * agy runs subagents as conversations of their own. Every conversation keeps a JSON-lines log at
+ * `brain/<id>/.system_generated/logs/transcript.jsonl` (agy hands the same path to the parent model).
+ * A parent's log holds each `invoke_subagent` call and the id of the conversation it created; a
+ * child reports back with `send_message`, which lands in the parent's `messages/` folder.
+ */
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CREATED_ID = /Created the following subagent:[\s\S]*?"conversationId"\s*:\s*"([0-9a-f-]{36})"/i;
+const TIME_HEADER = /^(?:(?:Created|Completed) At: [^\n]*\n)+/;
+/** A child with no new step for this long is no longer running, whatever its last step says. */
+const STALE_MS = 12 * 60_000;
+const MAX_DEPTH = 3;
+const MAX_ENTRIES = 300;
+
+interface ToolCall {
+  name: string;
+  args: Record<string, unknown>;
+}
+
+interface Row {
+  step_index: number;
+  source?: string;
+  type?: string;
+  status?: string;
+  created_at?: string;
+  content?: string;
+  thinking?: string;
+  tool_calls?: ToolCall[];
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+}
+
+interface Child {
+  id: string;
+  role: string | null;
+  type: string | null;
+  task: string;
+  /** Set when the parent stopped it with `manage_subagents` (`kill`). */
+  killedAt: string | null;
+}
+
+interface CachedLog {
+  size: number;
+  mtimeMs: number;
+  rows: Row[];
+  /** Where the last complete line starts; reading resumes there. */
+  offset: number;
+}
+
+function logPath(conversationId: string): string {
+  return path.join(REAL_CLI_DIR, "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
+}
+
+function inboxDir(conversationId: string): string {
+  return path.join(REAL_CLI_DIR, "brain", conversationId, ".system_generated", "messages");
+}
+
+/**
+ * Tool arguments are JSON-encoded strings in the log (`"Role": "\"Auditor\""`). Long values are
+ * cut short by agy, which leaves an unterminated JSON string; those are decoded leniently.
+ */
+function argValue(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const text = value.trim();
+  if (!text || !/^["[{]|^(true|false|null|-?\d)/.test(text)) return value;
+  try {
+    return JSON.parse(text);
+  } catch {
+    if (!text.startsWith('"')) return value;
+    const body = text.slice(1).replace(/\\$/, "");
+    try {
+      return JSON.parse(`"${body}"`);
+    } catch {
+      return body.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    }
+  }
+}
+
+function argText(call: ToolCall, key: string): string | null {
+  const value = argValue(call.args?.[key]);
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function oneLine(text: string, max = 140): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
+const SUMMARY_KEYS = [
+  "toolSummary",
+  "CommandLine",
+  "Path",
+  "AbsolutePath",
+  "TargetFile",
+  "File",
+  "DirectoryPath",
+  "SearchPath",
+  "Query",
+  "Pattern",
+  "Url",
+  "Role",
+  "Action",
+];
+
+export function describeCall(call: ToolCall): string {
+  const pathLike = new Set(["Path", "AbsolutePath", "TargetFile", "File", "DirectoryPath", "SearchPath"]);
+  for (const key of SUMMARY_KEYS) {
+    const value = argText(call, key);
+    if (!value) continue;
+    if (pathLike.has(key)) {
+      const start = argText(call, "StartLine");
+      const end = argText(call, "EndLine");
+      const range = start && end ? ` ${start}–${end}` : "";
+      return oneLine(`${path.basename(value)}${range}`);
+    }
+    return oneLine(value);
+  }
+  for (const value of Object.values(call.args ?? {})) {
+    const parsed = argValue(value);
+    if (typeof parsed === "string" && parsed.trim()) return oneLine(parsed);
+  }
+  return "";
+}
+
+function stripTimes(text: string): string {
+  return text.replace(TIME_HEADER, "").trim();
+}
+
+function clip(text: string | null | undefined, max: number): string | null {
+  if (!text) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
+}
+
+/** The text the parent sent, without agy's `<SYSTEM_MESSAGE>` wrapper. */
+function messageBody(content: string): string {
+  const inner = /content=([\s\S]*?)(?:<\/SYSTEM_MESSAGE>|$)/.exec(content)?.[1] ?? content;
+  return inner.trim();
+}
+
+export class SubagentReader {
+  private readonly logs = new Map<string, CachedLog>();
+  private readonly listCache = new Map<string, { at: number; value: SubagentList }>();
+
+  constructor(private readonly agents: ContextReader) {}
+
+  /**
+   * Reads a conversation log incrementally. agy appends a line per step but may rewrite the last
+   * line while that step runs, so the last complete line is read again every time.
+   */
+  private async rows(conversationId: string): Promise<{ rows: Row[]; mtimeMs: number } | null> {
+    const file = logPath(conversationId);
+    const stat = await fs.stat(file).catch(() => null);
+    if (!stat?.isFile()) return null;
+    let cached = this.logs.get(file);
+    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+      return { rows: cached.rows, mtimeMs: stat.mtimeMs };
+    }
+    if (!cached || stat.size < cached.offset) cached = { size: 0, mtimeMs: 0, rows: [], offset: 0 };
+    const length = stat.size - cached.offset;
+    const buffer = Buffer.alloc(Math.max(0, length));
+    const handle = await fs.open(file, "r");
+    try {
+      if (length > 0) await handle.read(buffer, 0, length, cached.offset);
+    } finally {
+      await handle.close();
+    }
+    const rows = cached.rows.slice();
+    const end = buffer.lastIndexOf(0x0a);
+    let lastStart = 0;
+    if (end >= 0) {
+      let start = 0;
+      for (;;) {
+        const newline = buffer.indexOf(0x0a, start);
+        const stop = newline < 0 || newline > end ? end : newline;
+        const line = buffer.subarray(start, stop).toString("utf8").trim();
+        if (line) {
+          try {
+            const row = JSON.parse(line) as Row;
+            if (typeof row.step_index === "number") {
+              let at = rows.length - 1;
+              while (at >= 0 && rows[at]!.step_index > row.step_index) at -= 1;
+              if (at >= 0 && rows[at]!.step_index === row.step_index) rows[at] = row;
+              else rows.splice(at + 1, 0, row);
+            }
+          } catch {
+            // A torn line: skip it.
+          }
+        }
+        lastStart = start;
+        if (stop >= end) break;
+        start = stop + 1;
+      }
+    }
+    const offset = end >= 0 ? cached.offset + lastStart : cached.offset;
+    this.logs.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, rows, offset });
+    return { rows, mtimeMs: stat.mtimeMs };
+  }
+
+  /** The children a conversation created, with the role and task it gave each. */
+  private async children(conversationId: string): Promise<Child[]> {
+    const log = await this.rows(conversationId);
+    if (!log) return [];
+    const pending: Array<{ role: string | null; type: string | null; task: string }> = [];
+    const found: Child[] = [];
+    const killed = new Map<string, string | null>();
+    for (const row of log.rows) {
+      for (const call of row.tool_calls ?? []) {
+        if (call.name === "manage_subagents" && argText(call, "Action") === "kill") {
+          const ids = argValue(call.args?.ConversationIds);
+          for (const id of Array.isArray(ids) ? ids : []) {
+            if (typeof id === "string") killed.set(id, row.created_at ?? null);
+          }
+        }
+        if (call.name !== "invoke_subagent") continue;
+        pending.push({
+          role: argText(call, "Role"),
+          type: argText(call, "TypeName"),
+          task: argText(call, "Prompt") ?? "",
+        });
+      }
+      const id = row.content ? CREATED_ID.exec(row.content)?.[1] : undefined;
+      if (id && UUID.test(id) && !found.some((child) => child.id === id)) {
+        const call = pending.shift() ?? { role: null, type: null, task: "" };
+        found.push({ id, ...call, killedAt: null });
+      }
+    }
+    for (const child of found) {
+      if (killed.has(child.id)) child.killedAt = killed.get(child.id) ?? "";
+    }
+    return found;
+  }
+
+  /** Messages a conversation received, by sender. */
+  private async reports(conversationId: string): Promise<Map<string, { at: string | null; content: string }>> {
+    const result = new Map<string, { at: string | null; content: string }>();
+    const dir = inboxDir(conversationId);
+    const names = await fs.readdir(dir).catch(() => [] as string[]);
+    for (const name of names) {
+      if (!name.endsWith(".json") || name === "read.json") continue;
+      try {
+        const message = JSON.parse(await fs.readFile(path.join(dir, name), "utf8")) as {
+          sender?: unknown;
+          timestamp?: unknown;
+          content?: unknown;
+        };
+        if (typeof message.sender !== "string" || typeof message.content !== "string") continue;
+        const at = typeof message.timestamp === "string" ? message.timestamp : null;
+        const previous = result.get(message.sender);
+        if (!previous || (at && (!previous.at || at > previous.at))) {
+          result.set(message.sender, { at, content: message.content });
+        }
+      } catch {
+        // Not a message file.
+      }
+    }
+    return result;
+  }
+
+  private async summarize(
+    child: Child,
+    parentId: string,
+    depth: number,
+    reported: { at: string | null; content: string } | undefined,
+    parentClosed: boolean,
+  ): Promise<SubagentSummary> {
+    const log = await this.rows(child.id);
+    const rows = log?.rows ?? [];
+    let tools = 0;
+    let input = 0;
+    let output = 0;
+    let cached = 0;
+    let model: string | null = null;
+    let lastCall: ToolCall | null = null;
+    for (const row of rows) {
+      tools += row.tool_calls?.length ?? 0;
+      input += row.input_tokens ?? 0;
+      output += row.output_tokens ?? 0;
+      cached += row.cache_read_tokens ?? 0;
+      if (row.model) model = row.model;
+      const calls = row.tool_calls ?? [];
+      if (calls.length) lastCall = calls[calls.length - 1]!;
+    }
+    const last = rows[rows.length - 1];
+    const dbStat = await fs
+      .stat(path.join(REAL_CLI_DIR, "conversations", `${child.id}.db-wal`))
+      .catch(() => fs.stat(path.join(REAL_CLI_DIR, "conversations", `${child.id}.db`)).catch(() => null));
+    const touched = Math.max(log?.mtimeMs ?? 0, dbStat?.mtimeMs ?? 0);
+    const finalAnswer = last?.type === "PLANNER_RESPONSE" && last.status === "DONE" && !(last.tool_calls?.length);
+    let state: SubagentState;
+    let phase: "thinking" | "tool" | null = null;
+    if (child.killedAt !== null && !finalAnswer) state = "stopped";
+    else if (!last) state = parentClosed ? "stopped" : "running";
+    else if (last.status === "CANCELED" || last.status === "INTERRUPTED") state = "stopped";
+    else if (finalAnswer) state = reported ? "done" : "idle";
+    else {
+      state = "running";
+      phase = last.type === "PLANNER_RESPONSE" && last.tool_calls?.length && last.status === "DONE" ? "tool" : "thinking";
+      if (last.type === "GENERIC" && last.status === "RUNNING") phase = "tool";
+    }
+    if (state === "running" && (parentClosed || Date.now() - touched > STALE_MS)) {
+      state = "stopped";
+      phase = null;
+    }
+    const activity =
+      state === "running" && phase === "thinking"
+        ? null
+        : lastCall
+          ? `${lastCall.name}${describeCall(lastCall) ? ` · ${describeCall(lastCall)}` : ""}`
+          : null;
+    return {
+      id: child.id,
+      parentId,
+      depth,
+      role: child.role,
+      type: child.type,
+      task: oneLine(child.task || messageBody(rows.find((row) => row.type === "SYSTEM_MESSAGE")?.content ?? ""), 600),
+      state,
+      phase,
+      activity,
+      steps: rows.length,
+      tools,
+      model,
+      inputTokens: input,
+      outputTokens: output,
+      cachedTokens: cached,
+      startedAt: rows[0]?.created_at ?? null,
+      updatedAt: last?.created_at ?? (touched ? new Date(touched).toISOString() : null),
+      reportedAt: reported?.at ?? null,
+    };
+  }
+
+  private async collect(
+    conversationId: string,
+    depth: number,
+    parentClosed: boolean,
+    out: SubagentSummary[],
+  ): Promise<void> {
+    if (depth > MAX_DEPTH) return;
+    const children = await this.children(conversationId);
+    if (!children.length) return;
+    const inbox = await this.reports(conversationId);
+    for (const child of children) {
+      const summary = await this.summarize(child, conversationId, depth, inbox.get(child.id), parentClosed);
+      out.push(summary);
+      await this.collect(child.id, depth + 1, parentClosed || summary.state === "stopped", out);
+    }
+  }
+
+  async list(paseo: PaseoApi, agentId: string): Promise<SubagentList> {
+    const cached = this.listCache.get(agentId);
+    if (cached && Date.now() - cached.at < 1500) return cached.value;
+    const info = await this.agents.conversationOf(paseo, agentId);
+    const value: SubagentList = { conversationId: info?.conversationId ?? null, subagents: [] };
+    if (info?.conversationId) {
+      await this.collect(info.conversationId, 1, info.closed, value.subagents);
+    }
+    this.listCache.set(agentId, { at: Date.now(), value });
+    return value;
+  }
+
+  async counts(paseo: PaseoApi, agentIds: readonly string[]): Promise<Record<string, { total: number; running: number }>> {
+    const result: Record<string, { total: number; running: number }> = {};
+    await Promise.all(
+      [...new Set(agentIds)].map(async (agentId) => {
+        const list = await this.list(paseo, agentId).catch(() => null);
+        if (!list) return;
+        result[agentId] = {
+          total: list.subagents.length,
+          running: list.subagents.filter((subagent) => subagent.state === "running").length,
+        };
+      }),
+    );
+    return result;
+  }
+
+  async detail(paseo: PaseoApi, agentId: string, subagentId: string): Promise<SubagentDetail> {
+    const list = await this.list(paseo, agentId);
+    const summary = list.subagents.find((subagent) => subagent.id === subagentId) ?? null;
+    // Only conversations this agent created can be read through it.
+    if (!summary) return { summary: null, entries: [], report: null, truncated: false };
+    const log = await this.rows(subagentId);
+    const rows = log?.rows ?? [];
+    const entries: TranscriptEntry[] = [];
+    const open: TranscriptEntry["tools"] = [];
+    let report: string | null = null;
+    for (const row of rows) {
+      if (row.type === "SYSTEM_MESSAGE" || row.type === "USER_INPUT") {
+        entries.push({
+          index: row.step_index,
+          kind: entries.length === 0 ? "task" : "message",
+          at: row.created_at ?? null,
+          text: clip(messageBody(row.content ?? ""), 4000),
+          thinking: null,
+          tools: [],
+          model: null,
+        });
+        continue;
+      }
+      if (row.type === "PLANNER_RESPONSE") {
+        const tools = (row.tool_calls ?? []).map((call) => {
+          if (call.name === "send_message") report = argText(call, "Message") ?? report;
+          return { name: call.name, summary: describeCall(call), output: null, failed: false };
+        });
+        open.push(...tools);
+        entries.push({
+          index: row.step_index,
+          kind: "response",
+          at: row.created_at ?? null,
+          text: clip(row.content, 4000),
+          thinking: clip(row.thinking, 1500),
+          tools,
+          model: row.model ?? null,
+        });
+        continue;
+      }
+      if (row.type === "GENERIC") {
+        const tool = open.shift();
+        if (tool) {
+          tool.output = clip(stripTimes(row.content ?? ""), 1200);
+          tool.failed = row.status === "ERROR";
+        }
+        continue;
+      }
+      if (row.type?.includes("ERROR")) {
+        entries.push({
+          index: row.step_index,
+          kind: "error",
+          at: row.created_at ?? null,
+          text: clip(row.content, 1200),
+          thinking: null,
+          tools: [],
+          model: null,
+        });
+      }
+    }
+    const inbox = await this.reports(summary.parentId);
+    const full = inbox.get(subagentId)?.content ?? null;
+    const truncated = entries.length > MAX_ENTRIES;
+    return {
+      summary,
+      entries: truncated ? entries.slice(-MAX_ENTRIES) : entries,
+      report: full ?? report,
+      truncated,
+    };
+  }
+
+  forget(agentId: string): void {
+    this.listCache.delete(agentId);
+  }
+}

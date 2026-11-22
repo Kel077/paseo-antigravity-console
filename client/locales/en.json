@@ -182,5 +182,71 @@
       "transient": "repeated errors",
       "error": "repeated errors"
     }
+  },
+  "subagents": {
+    "title": "Subagents",
+    "pill": "Subagents",
+    "pillLabel": "{{running}}/{{total}}",
+    "pillLabelIdle": "{{total}}",
+    "summary": "{{total}} · {{running}} running",
+    "summaryIdle": "{{total}}",
+    "state": {
+      "running": "Running",
+      "done": "Done",
+      "stopped": "Stopped",
+      "failed": "Failed",
+      "idle": "Waiting",
+      "starting": "Starting"
+    },
+    "thinking": "Thinking",
+    "steps_one": "{{count}} step",
+    "steps_other": "{{count}} steps",
+    "calls_one": "{{count}} call",
+    "calls_other": "{{count}} calls",
+    "output": "{{value}} out",
+    "open": "View",
+    "task": "Task",
+    "report": "Report",
+    "activity": "Activity",
+    "thinkingLabel": "Thinking",
+    "toolOutput": "Output",
+    "more": "Show more",
+    "less": "Show less",
+    "copy": "Copy report",
+    "copied": "Report copied",
+    "empty": "This agent has no subagents yet",
+    "pick": "Select a subagent",
+    "notAntigravity": "Antigravity agents only",
+    "truncated": "Showing the latest {{count}}",
+    "back": "Back",
+    "nested": "Started by {{role}}",
+    "check": {
+      "list": "Checked subagents",
+      "kill_one": "Stopped {{count}} subagent",
+      "kill_other": "Stopped {{count}} subagents",
+      "other": "Managed subagents · {{action}}"
+    },
+    "tokens": {
+      "input": "New input",
+      "cached": "Cached",
+      "output": "Output"
+    }
+  },
+  "orchestrator": {
+    "planner": "Planner",
+    "executor": "Executor",
+    "default": "agy default",
+    "pillTitle": "Orchestrator models",
+    "pillDefault": "Default",
+    "missingOn": "Not on {{accounts}}, which use agy's default",
+    "applied": {
+      "now": "Saved; this agent reopened with it",
+      "after-turn": "Saved; applies to this agent after this turn",
+      "none": "Saved for new sessions"
+    },
+    "manage": "Settings…",
+    "settingsPlanner": "Orchestrator planner",
+    "settingsExecutor": "Orchestrator executor",
+    "unavailable": "Could not read the model lists"
   }
 }

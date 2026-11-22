@@ -318,3 +318,176 @@ export const fallbackEventSchema = z.object({
 });
 
 export type FallbackEvent = z.infer<typeof fallbackEventSchema>;
+
+// ---- Orchestrator --------------------------------------------------------------------------
+
+/** Antigravity model ids that run the Orchestrator (a planner that hands work to an executor). */
+export function isOrchestratorModel(model: string | null | undefined): boolean {
+  return typeof model === "string" && model.startsWith("gemini-pro-orchestrator");
+}
+
+export const modelVariantSchema = z.object({
+  /** agy model id, for example `gemini-4-carbon-high`. */
+  id: z.string(),
+  /** agy model label, the value saved in settings.json, for example `Gemini 4 Carbon (High)`. */
+  label: z.string(),
+  /** Effort part of the label, for example `High`. */
+  effort: z.string(),
+});
+
+export const modelFamilySchema = z.object({
+  /** Model id without the effort suffix, for example `gemini-4-carbon`. */
+  id: z.string(),
+  /** Label without the effort, for example `Gemini 4 Carbon`. */
+  label: z.string(),
+  variants: z.array(modelVariantSchema),
+  /** Accounts that can run this family. */
+  accounts: z.array(z.string()),
+});
+export type ModelFamily = z.infer<typeof modelFamilySchema>;
+
+export const orchestratorStateSchema = z.object({
+  /** Saved planner label, or null for agy's default. */
+  planner: z.string().nullable(),
+  executor: z.string().nullable(),
+  planners: z.array(modelFamilySchema),
+  executors: z.array(modelFamilySchema),
+  /** Why the model lists could not be read, when they could not. */
+  error: z.string().nullable(),
+});
+export type OrchestratorState = z.infer<typeof orchestratorStateSchema>;
+
+export const getOrchestratorRpc = defineRpc({
+  name: "orchestrator.get",
+  input: z.object({ refresh: z.boolean().optional() }).strict(),
+  output: orchestratorStateSchema,
+});
+
+export const setOrchestratorRpc = defineRpc({
+  name: "orchestrator.set",
+  input: z
+    .object({
+      planner: z.string().min(1).max(80).nullable().optional(),
+      executor: z.string().min(1).max(80).nullable().optional(),
+      /** Agent to reopen with the new choice: now when idle, after its turn when running. */
+      applyTo: z.string().min(1).max(200).optional(),
+    })
+    .strict(),
+  output: z.object({
+    state: orchestratorStateSchema,
+    applied: z.enum(["now", "after-turn", "none"]),
+  }),
+});
+
+// ---- Subagents -----------------------------------------------------------------------------
+
+export const subagentStateSchema = z.enum(["running", "done", "stopped", "failed", "idle"]);
+export type SubagentState = z.infer<typeof subagentStateSchema>;
+
+export const subagentSummarySchema = z.object({
+  /** agy conversation id of the subagent. */
+  id: z.string(),
+  /** Parent conversation id; the agent's own conversation for direct children. */
+  parentId: z.string(),
+  depth: z.number().int().min(1),
+  role: z.string().nullable(),
+  type: z.string().nullable(),
+  /** Start of the task the parent gave it. */
+  task: z.string(),
+  state: subagentStateSchema,
+  /** While running: thinking about the next step, or running a tool. */
+  phase: z.enum(["thinking", "tool"]).nullable(),
+  /** Its latest tool call. */
+  activity: z.string().nullable(),
+  steps: z.number().int().nonnegative(),
+  tools: z.number().int().nonnegative(),
+  model: z.string().nullable(),
+  inputTokens: z.number().nonnegative(),
+  outputTokens: z.number().nonnegative(),
+  cachedTokens: z.number().nonnegative(),
+  startedAt: z.string().nullable(),
+  updatedAt: z.string().nullable(),
+  /** Set when it reported back to its parent. */
+  reportedAt: z.string().nullable(),
+});
+export type SubagentSummary = z.infer<typeof subagentSummarySchema>;
+
+export const subagentListSchema = z.object({
+  conversationId: z.string().nullable(),
+  subagents: z.array(subagentSummarySchema),
+});
+export type SubagentList = z.infer<typeof subagentListSchema>;
+
+export const listSubagentsRpc = defineRpc({
+  name: "subagents.list",
+  input: z.object({ agentId: z.string().min(1).max(200) }).strict(),
+  output: subagentListSchema,
+});
+
+export const subagentCountsRpc = defineRpc({
+  name: "subagents.counts",
+  input: z.object({ agentIds: z.array(z.string().min(1).max(200)).max(200) }).strict(),
+  output: z.object({
+    counts: z.record(z.string(), z.object({ total: z.number().int(), running: z.number().int() })),
+  }),
+});
+
+export const transcriptToolSchema = z.object({
+  name: z.string(),
+  /** One-line description of the call. */
+  summary: z.string(),
+  /** Start of the tool's output, when it finished. */
+  output: z.string().nullable(),
+  failed: z.boolean(),
+});
+
+export const transcriptEntrySchema = z.object({
+  index: z.number().int(),
+  kind: z.enum(["task", "message", "response", "error"]),
+  at: z.string().nullable(),
+  text: z.string().nullable(),
+  thinking: z.string().nullable(),
+  tools: z.array(transcriptToolSchema),
+  model: z.string().nullable(),
+});
+export type TranscriptEntry = z.infer<typeof transcriptEntrySchema>;
+
+export const subagentDetailSchema = z.object({
+  summary: subagentSummarySchema.nullable(),
+  entries: z.array(transcriptEntrySchema),
+  /** The report it sent to its parent, in full. */
+  report: z.string().nullable(),
+  /** True when older entries were left out. */
+  truncated: z.boolean(),
+});
+export type SubagentDetail = z.infer<typeof subagentDetailSchema>;
+
+export const subagentDetailRpc = defineRpc({
+  name: "subagents.detail",
+  input: z
+    .object({
+      agentId: z.string().min(1).max(200),
+      subagentId: z.string().regex(/^[0-9a-f-]{36}$/i),
+    })
+    .strict(),
+  output: subagentDetailSchema,
+});
+
+export const SUBAGENT_TIMELINE_KIND = "antigravity-subagent";
+export const SUBAGENT_LIST_TIMELINE_KIND = "antigravity-subagents-check";
+
+export const subagentCardSchema = z.object({
+  id: z.string(),
+  type: z.string().nullable(),
+  task: z.string(),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
+});
+export type SubagentCard = z.infer<typeof subagentCardSchema>;
+
+export const subagentCheckSchema = z.object({
+  action: z.string(),
+  /** States reported by that check, keyed by subagent id. */
+  states: z.array(z.object({ id: z.string(), role: z.string().nullable(), state: z.string() })),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
+});
+export type SubagentCheck = z.infer<typeof subagentCheckSchema>;

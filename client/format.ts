@@ -9,8 +9,10 @@ export function tokens(value: number): string {
   return String(value);
 }
 
+/** Fixed digits without trailing fraction zeros: 1.50 → "1.5", 300 → "300". */
 function trim(value: number, digits: number): string {
-  return value.toFixed(digits).replace(/\.?0+$/, "");
+  const text = value.toFixed(digits);
+  return text.includes(".") ? text.replace(/0+$/, "").replace(/\.$/, "") : text;
 }
 
 export function percent(fraction: number, locale: string): string {

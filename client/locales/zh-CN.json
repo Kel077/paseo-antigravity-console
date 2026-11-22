@@ -178,5 +178,68 @@
       "transient": "连续出错",
       "error": "连续出错"
     }
+  },
+  "subagents": {
+    "title": "子代理",
+    "pill": "子代理",
+    "pillLabel": "{{running}}/{{total}}",
+    "pillLabelIdle": "{{total}}",
+    "summary": "{{total}} 个 · {{running}} 个运行中",
+    "summaryIdle": "{{total}} 个",
+    "state": {
+      "running": "运行中",
+      "done": "已完成",
+      "stopped": "已停止",
+      "failed": "失败",
+      "idle": "等待中",
+      "starting": "启动中"
+    },
+    "thinking": "思考中",
+    "steps_other": "{{count}} 步",
+    "calls_other": "{{count}} 次调用",
+    "output": "输出 {{value}}",
+    "open": "查看",
+    "task": "任务",
+    "report": "报告",
+    "activity": "过程",
+    "thinkingLabel": "思考",
+    "toolOutput": "输出",
+    "more": "展开",
+    "less": "收起",
+    "copy": "复制报告",
+    "copied": "已复制报告",
+    "empty": "这个 agent 还没有子代理",
+    "pick": "选择一个子代理",
+    "notAntigravity": "只适用于 Antigravity agent",
+    "truncated": "只显示最近 {{count}} 条",
+    "back": "返回",
+    "nested": "由「{{role}}」创建",
+    "check": {
+      "list": "查看了子代理状态",
+      "kill_other": "停止了 {{count}} 个子代理",
+      "other": "管理子代理 · {{action}}"
+    },
+    "tokens": {
+      "input": "新输入",
+      "cached": "缓存命中",
+      "output": "输出"
+    }
+  },
+  "orchestrator": {
+    "planner": "Planner",
+    "executor": "Executor",
+    "default": "agy 默认",
+    "pillTitle": "Orchestrator 模型",
+    "pillDefault": "默认",
+    "missingOn": "{{accounts}} 不支持，会用 agy 默认",
+    "applied": {
+      "now": "已保存，这个 agent 已按新设置重新打开",
+      "after-turn": "已保存，这一轮结束后对这个 agent 生效",
+      "none": "已保存，新会话生效"
+    },
+    "manage": "设置…",
+    "settingsPlanner": "Orchestrator planner",
+    "settingsExecutor": "Orchestrator executor",
+    "unavailable": "读取模型列表失败"
   }
 }
