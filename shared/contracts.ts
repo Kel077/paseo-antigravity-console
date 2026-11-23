@@ -227,12 +227,14 @@ export const clearCooldownRpc = defineRpc({
 /** The folder in the daemon user's home that receives a removed account's saved files. */
 export const RECOVERY_FOLDER_NAME = "Antigravity Console";
 
-/** Files agents saved in a profile account's home folder, and where removing the account puts them. */
+/** Files agents saved in a profile account's home folder, and where removing or recovering puts them. */
 export const savedFilesSchema = z.object({
   /** Files and folders, relative to the account's home folder. */
   items: z.array(z.string()),
-  /** The folder they are (or would be) moved to, with the home folder written as `~`. */
+  /** The folder they are (or would be) moved or copied to, with the home folder written as `~`. */
   folder: z.string(),
+  /** Subset of `items` that were copied instead of moved (originals left in place, e.g. across volumes). */
+  copied: z.array(z.string()).optional(),
 });
 export type SavedFiles = z.infer<typeof savedFilesSchema>;
 

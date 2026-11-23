@@ -297,30 +297,89 @@ async function freePath(destination: string): Promise<string> {
   }
 }
 
+type MoveOutcome = "moved" | "copied" | "skipped";
+
 /**
- * Moves a file or folder out of the profile without replacing anything, copying when it crosses to
- * another volume. The copied source is deleted only while it is still behind real folders.
+ * Copies a file, symlink, or directory tree across volumes during account removal, removing only
+ * each individual copied entry (checking that a regular file was not modified during copy) and
+ * using `rmdir` on directories so any file written by a running agent after traversal stays intact
+ * rather than being deleted recursively.
  */
-async function move(accountId: string, source: string, destination: string): Promise<void> {
+async function moveAcrossVolumes(accountId: string, source: string, target: string): Promise<void> {
+  const stat = await profileEntry(accountId, source);
+  if (!stat) return;
+  if (stat.isSymbolicLink()) {
+    const linkTarget = await fs.readlink(source);
+    await fs.symlink(linkTarget, target);
+    if ((await profileEntry(accountId, source))?.isSymbolicLink()) {
+      await fs.unlink(source).catch(() => undefined);
+    }
+    return;
+  }
+  if (stat.isFile()) {
+    await fs.copyFile(source, target, fs.constants.COPYFILE_EXCL);
+    await fs.utimes(target, stat.atime, stat.mtime).catch(() => undefined);
+    const after = await profileEntry(accountId, source);
+    if (
+      after?.isFile() &&
+      after.ino === stat.ino &&
+      after.size === stat.size &&
+      after.mtimeMs === stat.mtimeMs
+    ) {
+      await fs.unlink(source).catch(() => undefined);
+    }
+    return;
+  }
+  if (stat.isDirectory()) {
+    await fs.mkdir(target, { recursive: true });
+    for (const entry of await readDirSafe(source)) {
+      await moveAcrossVolumes(accountId, path.join(source, entry.name), path.join(target, entry.name));
+    }
+    await fs.utimes(target, stat.atime, stat.mtime).catch(() => undefined);
+    // rmdir removes only an empty directory, so files written concurrently stay for the next pass.
+    if ((await profileEntry(accountId, source))?.isDirectory()) {
+      await fs.rmdir(source).catch(() => undefined);
+    }
+  }
+}
+
+/**
+ * Moves a file or folder out of the profile without replacing anything. On EXDEV (different
+ * volumes): when `preserveOnExdev` is set, copies the source and leaves the original in place so
+ * concurrent writes by a running agent can never be deleted; otherwise moves entry-by-entry
+ * without recursive deletion.
+ */
+async function move(
+  accountId: string,
+  source: string,
+  destination: string,
+  options: { preserveOnExdev?: boolean } = {},
+): Promise<MoveOutcome> {
   await fs.mkdir(path.dirname(destination), { recursive: true });
   const target = await freePath(destination);
   try {
     await fs.rename(source, target);
+    return "moved";
   } catch (error) {
     if (errorCode(error) !== "EXDEV") throw error;
-    await fs.cp(source, target, {
-      recursive: true,
-      errorOnExist: true,
-      force: false,
-      preserveTimestamps: true,
-      verbatimSymlinks: true,
-      // Sockets and pipes cannot be copied and hold nothing worth keeping.
-      filter: async (file) => {
-        const stat = await fs.lstat(file);
-        return stat.isFile() || stat.isDirectory() || stat.isSymbolicLink();
-      },
-    });
-    if (await profileEntry(accountId, source)) await fs.rm(source, { recursive: true, force: true });
+    if (options.preserveOnExdev) {
+      if (!(await profileEntry(accountId, source))) return "skipped";
+      await fs.cp(source, target, {
+        recursive: true,
+        errorOnExist: true,
+        force: false,
+        preserveTimestamps: true,
+        verbatimSymlinks: true,
+        // Sockets and pipes cannot be copied and hold nothing worth keeping.
+        filter: async (file) => {
+          const stat = await fs.lstat(file).catch(() => null);
+          return Boolean(stat && (stat.isFile() || stat.isDirectory() || stat.isSymbolicLink()));
+        },
+      });
+      return "copied";
+    }
+    await moveAcrossVolumes(accountId, source, target);
+    return "moved";
   }
 }
 
@@ -341,15 +400,19 @@ async function clearProfile(dir: string): Promise<boolean> {
 }
 
 export interface PreservedFiles {
-  /** Absolute path of the folder the saved files were moved to. */
+  /** Absolute path of the folder the saved files were moved or copied to. */
   folder: string;
-  /** The moved entries, relative to the profile HOME (and to `folder`). */
+  /** The recovered entries, relative to the profile HOME (and to `folder`). */
   items: string[];
+  /** Subset of `items` that were copied instead of moved (originals left in place). */
+  copied: string[];
 }
 
 /**
- * Moves saved files out of a profile HOME into RECOVERY_DIR without removing the account or its
- * sign-in. Returns null when there were no saved files.
+ * Recovers saved files out of a profile HOME into RECOVERY_DIR without removing the account or its
+ * sign-in. Uses atomic rename on the same volume; across volumes (EXDEV), copies files and leaves
+ * the originals untouched so a running agent cannot lose concurrent writes. Returns null when there
+ * were no saved files.
  */
 export function recoverSavedFiles(accountId: string, label: string): Promise<PreservedFiles | null> {
   return withLock(accountId, async () => {
@@ -357,21 +420,28 @@ export function recoverSavedFiles(accountId: string, label: string): Promise<Pre
     const items = await savedFiles(accountId);
     if (!items.length) return null;
     let folder: string | null = null;
-    const moved: string[] = [];
-    const movedSoFar = () => (folder ? ` Files moved so far are in ${displayPath(folder)}.` : "");
+    const recovered: string[] = [];
+    const copied: string[] = [];
+    const savedSoFar = () => (folder ? ` Files recovered so far are in ${displayPath(folder)}.` : "");
     for (const item of items) {
       const source = path.join(home, item);
       if (!(await profileEntry(accountId, source))) continue;
       folder ??= await claimRecoveryFolder(label);
       try {
-        await move(accountId, source, path.join(folder, item));
+        const outcome = await move(accountId, source, path.join(folder, item), { preserveOnExdev: true });
+        if (outcome === "skipped") continue;
+        if (outcome === "copied") copied.push(item);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        throw new Error(`Couldn't move ${item} out of the account's home folder: ${reason}.${movedSoFar()}`);
+        throw new Error(`Couldn't recover ${item} from the account's home folder: ${reason}.${savedSoFar()}`);
       }
-      moved.push(item);
+      recovered.push(item);
     }
-    return folder ? { folder, items: moved } : null;
+    if (folder && recovered.length === 0) {
+      await fs.rmdir(folder).catch(() => undefined);
+      return null;
+    }
+    return folder ? { folder, items: recovered, copied } : null;
   });
 }
 
@@ -408,7 +478,7 @@ export function removeProfile(accountId: string, label: string): Promise<Preserv
       if (pass === 1 && (await profileEntry(accountId, cli))?.isDirectory()) {
         await fs.rm(cli, { recursive: true, force: true });
       }
-      if (await clearProfile(profileRoot(accountId))) return folder ? { folder, items: moved } : null;
+      if (await clearProfile(profileRoot(accountId))) return folder ? { folder, items: moved, copied: [] } : null;
     }
     throw new Error(`Files keep appearing in the account's home folder. Stop its agents and remove it again.${movedSoFar()}`);
   });

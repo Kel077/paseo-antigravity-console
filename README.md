@@ -33,7 +33,7 @@ Paseo runs `agy` for every Antigravity agent. This plugin hooks those launches:
 
 - Each extra account gets its own `HOME` under `~/.paseo/plugin-data/antigravity-accounts/profiles/`. It mirrors your real home with symlinks, except for agy's sign-in, which agy keeps there as a file. Conversation folders link back to the real ones, so every account sees the same conversations and an agent can change accounts mid-conversation.
 - Before an account launches, the plugin atomically copies `~/.gemini/antigravity-cli/settings.json` into its profile and applies any per-account Orchestrator override.
-- Removing an account deletes its sign-in and agy's data for it. Files agents saved in its `HOME` are moved to `~/Antigravity Console/<account name>` first, and the Remove dialog lists them. You can also recover saved files anytime without removing the account.
+- Removing an account deletes its sign-in and agy's data for it. Files agents saved in its `HOME` are moved to `~/Antigravity Console/<account name>` first, and the Remove dialog lists them. You can also recover saved files anytime without removing the account (copying them and leaving originals in place when the profile and recovery folders are on different volumes).
 - Quota comes from `agy -p /usage`, the plan from the sign-in check of `agy acp`, model lists from `agy models`. Paseo's own Antigravity usage source reports the system sign-in and the account each agent runs on; the plugin adds the accounts it created to Paseo's Usage. Usage statistics, context use, and subagents (including artifacts) are read from agy's own records under `~/.gemini/antigravity-cli`.
 - Global planner and executor choices are written to the `orchestrator` entry of agy's `settings.json`.
 

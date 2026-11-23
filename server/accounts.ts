@@ -542,11 +542,17 @@ export class AccountService {
     };
   }
 
-  /** Moves files agents saved in a profile HOME into ~/Antigravity Console without deleting the account. */
+  /** Recovers files agents saved in a profile HOME into ~/Antigravity Console without deleting the account. */
   async recoverSavedFiles(accountId: string): Promise<SavedFiles | null> {
     const account = this.requireProfileAccount(accountId);
     const preserved = await recoverSavedFiles(accountId, account.label);
-    return preserved ? { items: preserved.items, folder: displayPath(preserved.folder) } : null;
+    return preserved
+      ? {
+          items: preserved.items,
+          folder: displayPath(preserved.folder),
+          ...(preserved.copied.length ? { copied: preserved.copied } : {}),
+        }
+      : null;
   }
 
   /** Removes a profile account. Returns where its saved files went, or null when it had none. */

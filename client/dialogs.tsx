@@ -235,9 +235,17 @@ export function RecoverFilesDialog({
     try {
       const { moved } = await recover({ accountId: account.id });
       if (moved) {
-        toast.show(t("dialog.removedMoved", { count: moved.items.length, folder: moved.folder }), {
+        const copiedCount = moved.copied?.length ?? 0;
+        const movedCount = Math.max(0, moved.items.length - copiedCount);
+        const message =
+          copiedCount === 0
+            ? t("dialog.removedMoved", { count: moved.items.length, folder: moved.folder })
+            : movedCount === 0
+              ? t("dialog.recoverCopied", { count: copiedCount, folder: moved.folder })
+              : t("dialog.recoverMixed", { moved: movedCount, copied: copiedCount, folder: moved.folder });
+        toast.show(message, {
           variant: "success",
-          durationMs: 8000,
+          durationMs: copiedCount > 0 ? 10_000 : 8000,
         });
       }
       onClose();
@@ -259,7 +267,7 @@ export function RecoverFilesDialog({
               colors={colors}
               tone="neutral"
               icon="FolderInput"
-              title={`${t("dialog.removeFiles", { count: saved.items.length })}\n${saved.folder}`}
+              title={`${t("dialog.recoverFiles", { count: saved.items.length })}\n${saved.folder}`}
             >
               <SavedList colors={colors} items={saved.items} />
             </Callout>
