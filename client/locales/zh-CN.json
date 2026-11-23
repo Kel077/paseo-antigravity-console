@@ -4,7 +4,6 @@
   "refreshAll": "刷新",
   "loading": "加载中…",
   "retry": "重试",
-  "working": "处理中…",
   "systemName": "系统登录",
   "overview": {
     "default": "新 agent 默认使用",
@@ -27,6 +26,16 @@
     "error": "检查失败"
   },
   "badgeDefault": "默认",
+  "badgeNoFallback": "仅手动",
+  "badgeCustomOrchestrator": "自定义 Orchestrator",
+  "badgeCooldown": "冷却中（{{pool}}，{{time}}）",
+  "cooldownPool": {
+    "all": "全账号",
+    "gemini": "Gemini",
+    "third-party": "Claude / GPT"
+  },
+  "clearCooldown": "解除冷却",
+  "cooldownCleared": "已解除「{{label}}」的冷却状态",
   "agents_zero": "没有 agent",
   "agents_other": "{{count}} 个 agent",
   "checked": "{{time}}检查过",
@@ -46,6 +55,14 @@
     "refresh": "刷新",
     "rename": "重命名",
     "makeDefault": "设为新 agent 默认",
+    "moveUp": "提高切换优先级",
+    "moveDown": "降低切换优先级",
+    "enableFallback": "参与自动切换",
+    "disableFallback": "不参与自动切换",
+    "clearCooldown": "解除冷却",
+    "orchestratorOverride": "单独设置 Orchestrator…",
+    "recoverFiles": "查看/回收主目录文件…",
+    "manageAgents": "查看在用 agent…",
     "signIn": "登录",
     "signInAgain": "重新登录",
     "signOut": "退出登录",
@@ -67,6 +84,7 @@
     "namePlaceholder": "工作",
     "continue": "继续",
     "save": "保存",
+    "close": "关闭",
     "cancel": "取消",
     "removeTitle": "移除「{{label}}」？",
     "removeBody": "会删除它的登录信息，以及 agy 为这个账号保存的日志、缓存等数据。对话保留。",
@@ -74,7 +92,30 @@
     "removeFilesUnknown": "这个账号主目录里保存的文件会移到：",
     "removeMore": "还有 {{count}} 项",
     "removedMoved_other": "已把 {{count}} 项移到 {{folder}}",
-    "removeConfirm": "移除"
+    "removeConfirm": "移除",
+    "recoverTitle": "「{{label}}」主目录中的文件",
+    "recoverEmpty": "这个账号的主目录里没有额外保存的文件。",
+    "recoverBody": "此前运行在这个账号上的 agent 直接在它的主目录创建了以下文件。移出后账号本身不受影响。",
+    "recoverConfirm": "移出到回收目录",
+    "agentsTitle": "正在使用「{{label}}」的 agent",
+    "agentsEmpty": "当前没有未归档的 Antigravity agent 使用这个账号。",
+    "agentsOpen": "打开",
+    "agentsRunning": "运行中",
+    "agentsIdle": "空闲",
+    "migrateHeading": "批量迁移 agent",
+    "migrateTarget": "目标账号",
+    "migrateMode": "运行中的 agent",
+    "migrateModeAfterTurn": "本轮结束后切换",
+    "migrateModeIdleOnly": "跳过运行中的",
+    "migrateModeNow": "立即切换",
+    "migrateAction": "开始迁移",
+    "migrateNoTarget": "没有其他已登录的可用账号。",
+    "migrateDone": "已迁移至「{{label}}」：立即切换 {{switched}} 个，排队切换 {{scheduled}} 个，跳过 {{skipped}} 个。",
+    "migrateFailed": "{{count}} 个迁移失败。",
+    "overrideTitle": "「{{label}}」的 Orchestrator 设置",
+    "overrideInherit": "继承全局设置",
+    "overrideCustom": "为此账号单独指定",
+    "overrideSaved": "已保存「{{label}}」的 Orchestrator 设置"
   },
   "signin": {
     "title": "登录「{{label}}」",
@@ -90,7 +131,8 @@
     "expires": "链接{{time}}失效",
     "expired": "链接已失效。",
     "restart": "重新获取链接",
-    "done": "已登录「{{label}}」"
+    "done": "已登录「{{label}}」",
+    "singleLine": "请粘贴单行内容：授权码或跳转页面的完整网址。"
   },
   "account": "账号",
   "composerDescription": "{{detail}} · {{status}}",
@@ -109,6 +151,8 @@
   "noMatch": "没有匹配的账号。输入 /account 查看列表。",
   "ambiguous": "有多个账号匹配，请使用 /account 列出的序号。",
   "unusable": "这个账号现在无法使用。",
+  "commandRefresh": "刷新所有 Antigravity 额度",
+  "commandRefreshed": "已刷新所有 Antigravity 额度",
   "context": {
     "label": "{{used}}/{{size}} · {{pct}}",
     "labelNoSize": "{{used}} tokens",
@@ -124,8 +168,7 @@
     "updated": "{{time}}更新",
     "updatedJustNow": "刚刚更新",
     "note": "最近一次模型调用。",
-    "none": "还没有模型调用。",
-    "tokens": "tokens"
+    "none": "还没有模型调用。"
   },
   "stats": {
     "title": "用量",
@@ -134,6 +177,27 @@
       "7d": "7 天",
       "30d": "30 天"
     },
+    "scope": {
+      "all": "全部",
+      "main": "主对话",
+      "subagent": "子代理"
+    },
+    "metric": {
+      "requests": "请求",
+      "cost": "费用",
+      "tokens": "Tokens",
+      "tps": "速度",
+      "cache": "缓存",
+      "firstToken": "首字"
+    },
+    "estimatedCost": "预估费用",
+    "costAvg": "均价 {{avg}} / 次",
+    "costAvgCustom": "均价 {{avg}} / 次 · 自定义",
+    "costWithUnpriced": "{{avg}} / 次 · {{unpriced}} 次未定价",
+    "accountAll": "全部账号",
+    "filterModel": "模型：{{model}}",
+    "clearFilter": "清除",
+    "splitSummary": "主对话 {{main}} · 子代理 {{subagent}}",
     "requests": "请求次数",
     "speed": "输出速度",
     "cache": "缓存命中率",
@@ -142,26 +206,56 @@
     "outputTokens": "输出 {{value}} tokens",
     "cachedTokens": "命中 {{value}} tokens",
     "avgContext": "平均上下文 {{value}}",
-    "perHour": "每小时请求",
-    "perSixHours": "每 6 小时请求",
-    "perDay": "每天请求",
+    "perHour": "每小时",
+    "perSixHours": "每 6 小时",
+    "perDay": "每天",
     "readoutRequests_other": "{{count}} 次请求",
+    "readoutTokens": "{{value}} tokens",
     "readoutTps": "{{value}} tok/s",
     "readoutCache": "缓存 {{value}}",
     "readoutFirstToken": "首字 {{value}}",
     "noRequests": "无请求",
     "empty": "这段时间没有 Antigravity 请求",
     "models": "按模型",
+    "modelsHint": "点击模型行可筛选上方趋势图",
     "tps": "{{value}} tok/s",
     "col": {
       "model": "模型",
       "requests": "请求",
+      "cost": "预估费用",
       "context": "平均上下文",
       "output": "平均输出",
       "speed": "速度",
       "cache": "缓存命中",
       "firstToken": "首字延迟"
     }
+  },
+  "pricing": {
+    "button": "API 价格",
+    "title": "API 价格设置（美元 / 1M tokens）",
+    "subtitle": "默认按 Google 官方 Gemini API 价格（第三方模型按对应厂商官方价）逐次请求估算，点击任意模型即可自定义修改。",
+    "badgeCustom": "自定义",
+    "badgeUsed": "已使用",
+    "unpriced": "未定价",
+    "officialRef": "官方参考：输入 ${{input}} · 缓存 ${{cached}} · 输出 ${{output}}",
+    "input": "输入 / 1M",
+    "cached": "缓存 / 1M",
+    "output": "输出 / 1M",
+    "longContextToggle": "为 >200K 长上下文单独定价",
+    "longInput": ">200K 输入",
+    "longCached": ">200K 缓存",
+    "longOutput": ">200K 输出",
+    "resetDefault": "恢复官方价",
+    "removeCustom": "移除",
+    "resetAll": "全部恢复官方价",
+    "addModel": "添加自定义模型价格",
+    "modelKeyPlaceholder": "模型标识，例如 gemini-4-pro",
+    "invalidKey": "请输入模型标识。",
+    "invalidRate": "请为所有价格项输入大于等于 0 的数字。",
+    "saved": "已保存 API 价格",
+    "restored": "已恢复官方价格",
+    "restoredAll": "已将所有模型恢复为官方价格",
+    "editFor": "修改 {{model}} 的 API 价格"
   },
   "sidebar": {
     "label": "Antigravity：5 小时额度剩余 {{fiveHour}}，每周额度剩余 {{weekly}}"
@@ -170,7 +264,11 @@
     "fallback": "出错时自动切换账号",
     "retries": "切换前重试",
     "retryNone": "不重试",
-    "retryCount_other": "{{count}} 次"
+    "retryCount_other": "{{count}} 次",
+    "strategy": "自动切换选号策略",
+    "strategyOrder": "按列表优先级顺序",
+    "strategyQuota": "剩余额度最多优先",
+    "strategyReset": "最快重置优先"
   },
   "fallback": {
     "switch": "「{{from}}」{{reason}}，已切换到「{{to}}」继续",
@@ -188,6 +286,7 @@
     "pill": "子代理",
     "pillLabel": "{{running}}/{{total}}",
     "pillLabelIdle": "{{total}}",
+    "workspaceBadge_other": "{{count}} 个子代理运行中",
     "summary": "{{total}} 个 · {{running}} 个运行中",
     "summaryIdle": "{{total}} 个",
     "state": {
@@ -198,6 +297,21 @@
       "idle": "等待中",
       "starting": "启动中"
     },
+    "filter": {
+      "all": "全部",
+      "running": "运行中",
+      "failed": "失败"
+    },
+    "searchPlaceholder": "搜索子代理…",
+    "activityFilter": {
+      "all": "全部",
+      "tools": "仅工具",
+      "errors": "仅错误"
+    },
+    "activitySearch": "搜索过程日志…",
+    "follow": "自动滚底",
+    "jumpBottom": "跳到最新",
+    "noMatches": "没有匹配的记录",
     "thinking": "思考中",
     "steps_other": "{{count}} 步",
     "calls_other": "{{count}} 次调用",
@@ -205,13 +319,20 @@
     "open": "查看",
     "task": "任务",
     "report": "报告",
+    "artifacts": "产物文件",
+    "artifactLoading": "正在读取文件…",
+    "artifactTruncated": "仅显示前 256 KB 内容。",
     "activity": "过程",
-    "thinkingLabel": "思考",
     "toolOutput": "输出",
     "more": "展开",
     "less": "收起",
     "copy": "复制报告",
     "copied": "已复制报告",
+    "copyTranscript": "复制完整记录",
+    "transcriptCopied": "已复制完整记录",
+    "insertReport": "插入到父对话",
+    "insertedReport": "已插入到父对话输入框",
+    "composerUnavailable": "未找到对应父对话的输入框",
     "empty": "这个 agent 还没有子代理",
     "pick": "选择一个子代理",
     "notAntigravity": "只适用于 Antigravity agent",
@@ -221,6 +342,8 @@
     "check": {
       "list": "查看了子代理状态",
       "kill_other": "停止了 {{count}} 个子代理",
+      "killAll": "停止了全部子代理",
+      "killAllCount_other": "停止了全部 {{count}} 个子代理",
       "other": "管理子代理 · {{action}}"
     },
     "tokens": {
@@ -235,7 +358,12 @@
     "default": "agy 默认",
     "pillTitle": "Orchestrator 模型",
     "pillDefault": "默认",
+    "pillOverride": "账号单独覆写",
     "missingOn": "{{accounts}} 不支持，会用 agy 默认",
+    "presets": "快捷预设",
+    "presetDefault": "agy 默认",
+    "presetQuality": "高配质量",
+    "presetBalanced": "均衡",
     "applied": {
       "now": "已保存，这个 agent 已按新设置重新打开",
       "after-turn": "已保存，这一轮结束后对这个 agent 生效",
@@ -244,6 +372,10 @@
     "manage": "设置…",
     "settingsPlanner": "Orchestrator planner",
     "settingsExecutor": "Orchestrator executor",
-    "unavailable": "读取模型列表失败"
+    "unavailable": "读取模型列表失败",
+    "slash": "查看或切换 Orchestrator 的 planner/executor（如 default、quality、balanced）",
+    "slashHint": "[default|quality|balanced|planner <名称>|executor <名称>]",
+    "slashCurrent": "Orchestrator — Planner：{{planner}} · Executor：{{executor}}",
+    "slashNoMatch": "没有匹配的 Orchestrator 模型或预设。"
   }
 }

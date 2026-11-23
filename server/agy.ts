@@ -9,21 +9,18 @@ import { REAL_CLI_DIR, profileCliDir, profileHome } from "./paths";
 /** agy 1.5 keeps Google sign-ins in one OS keyring entry unless it believes it runs over SSH. */
 export const FAKE_SSH_CONNECTION = "127.0.0.1 0 127.0.0.1 0";
 
-/** Marker the usage source reads back from a session's environment. */
-export const ACCOUNT_ENV = "PASEO_AGY_ACCOUNT";
-
 /**
  * Environment added to an agent session on a profile account. HOME moves agy's data directory and
  * hides the keyring sign-in; SSH_CONNECTION makes agy store its own sign-in in a file inside HOME.
- * ANTIGRAVITY_HOME is ignored by agy but keeps Paseo's built-in usage reader per account.
+ * ANTIGRAVITY_HOME is ignored by agy, but Paseo's built-in usage source reads it to show the quota
+ * of the account the agent runs on.
  */
 export function sessionEnv(accountId: string, current: Readonly<Record<string, string>>): Record<string, string> {
-  if (accountId === SYSTEM_ACCOUNT_ID) return { [ACCOUNT_ENV]: SYSTEM_ACCOUNT_ID };
+  if (accountId === SYSTEM_ACCOUNT_ID) return {};
   return {
     HOME: profileHome(accountId),
     SSH_CONNECTION: current.SSH_CONNECTION || FAKE_SSH_CONNECTION,
     ANTIGRAVITY_HOME: profileCliDir(accountId),
-    [ACCOUNT_ENV]: accountId,
   };
 }
 
@@ -146,7 +143,7 @@ export type ProbeResult =
 
 const SIGN_IN_TEXT = /(authentication required|authentication failed|not signed in|sign in|log in|login)/i;
 /** agy prints this and then waits up to 60 s for a code; there is no point waiting. */
-const NEEDS_SIGN_IN = /Authentication required|paste the authorization code/i;
+export const NEEDS_SIGN_IN = /Authentication required|paste the authorization code/i;
 
 function firstMeaningfulLine(text: string): string {
   const line = text
@@ -203,6 +200,101 @@ export async function probeAccount(agyPath: string, accountId: string): Promise<
     kind: "error",
     detail: firstMeaningfulLine(combined) || `agy exited with code ${String(result.code)}`,
   };
+}
+
+export interface AccountPlan {
+  /** agy's tier id, for example "g1-pro-tier". */
+  id: string;
+  /** The plan's name, for example "Google AI Pro". */
+  name: string;
+}
+
+const PLAN_TIMEOUT_MS = 15_000;
+/** The consumer Google sign-in, the one agy uses for Google AI plans. */
+const PERSONAL_SIGN_IN = "oauth-personal";
+
+const acpInitialize = z.object({
+  agentCapabilities: z.object({
+    _meta: z.object({ antigravity: z.object({ tier: z.literal(true) }) }),
+  }),
+  authMethods: z.array(z.object({ id: z.string() })),
+});
+
+const acpAuthenticate = z.object({
+  _meta: z.object({
+    antigravity: z.object({ tier: z.object({ id: z.string(), name: z.string().trim().min(1) }) }),
+  }),
+});
+
+/**
+ * The Google AI plan of a signed-in account, for example "Google AI Ultra". `/usage` does not
+ * report it. agy's ACP server advertises `_meta.antigravity.tier` and answers `authenticate` with
+ * the account's tier, reusing the stored sign-in. For a signed-out account `authenticate` would
+ * start a sign-in instead, so call this only after the quota probe found the account signed in.
+ * Returns null when agy does not report a plan.
+ */
+export function readPlan(agyPath: string, accountId: string): Promise<AccountPlan | null> {
+  return new Promise((resolve) => {
+    const child = spawn(agyPath, ["acp", "--disable-telemetry"], {
+      cwd: accountId === SYSTEM_ACCOUNT_ID ? os.tmpdir() : profileHome(accountId),
+      env: commandEnv(accountId),
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: false,
+    });
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => finish(null), PLAN_TIMEOUT_MS);
+    function finish(plan: AccountPlan | null) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdin.destroy();
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+      resolve(plan);
+    }
+    function send(id: number, method: string, params: unknown) {
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    }
+    function answer(message: { id?: unknown; result?: unknown }) {
+      if (message.id === 1) {
+        const init = acpInitialize.safeParse(message.result);
+        if (!init.success || !init.data.authMethods.some((method) => method.id === PERSONAL_SIGN_IN)) {
+          finish(null);
+          return;
+        }
+        send(2, "authenticate", { methodId: PERSONAL_SIGN_IN });
+      } else if (message.id === 2) {
+        const auth = acpAuthenticate.safeParse(message.result);
+        finish(auth.success ? auth.data._meta.antigravity.tier : null);
+      }
+    }
+    child.on("error", () => finish(null));
+    child.on("close", () => finish(null));
+    child.stdin.on("error", () => finish(null));
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.length < 64 * 1024) stderr += chunk.toString("utf8");
+      if (NEEDS_SIGN_IN.test(stderr)) finish(null);
+    });
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+      let newline = stdout.indexOf("\n");
+      while (newline >= 0 && !settled) {
+        const line = stdout.slice(0, newline).trim();
+        stdout = stdout.slice(newline + 1);
+        newline = stdout.indexOf("\n");
+        if (!line.startsWith("{")) continue;
+        try {
+          answer(JSON.parse(line) as { id?: unknown; result?: unknown });
+        } catch {
+          // Not a JSON-RPC message.
+        }
+      }
+      if (stdout.length > 1024 * 1024) finish(null);
+    });
+    send(1, "initialize", { protocolVersion: 1, clientCapabilities: {} });
+  });
 }
 
 const EMAIL_LINE = /authenticated successfully as (\S+@\S+)/g;

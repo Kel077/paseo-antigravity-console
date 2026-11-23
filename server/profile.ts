@@ -1,6 +1,7 @@
 import type { Dirent, Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { OrchestratorChoice } from "../shared/contracts";
 import {
   REAL_CLI_DIR,
   REAL_GEMINI,
@@ -25,6 +26,7 @@ import {
 export const CREDENTIAL_NAME = /(auth|token|cred|oauth|keyring|secret|account)/i;
 
 const locks = new Map<string, Promise<unknown>>();
+let settingsSeq = 0;
 
 function withLock<T>(key: string, task: () => Promise<T>): Promise<T> {
   const previous = locks.get(key) ?? Promise.resolve();
@@ -105,7 +107,7 @@ async function mirror(
   await pruneLinks(destinationDir, sourceDir, keep);
 }
 
-async function syncProfile(accountId: string): Promise<string> {
+async function syncProfile(accountId: string, orchestratorOverride?: OrchestratorChoice | null): Promise<string> {
   const home = profileHome(accountId);
   await ensureRealDir(profileRoot(accountId));
   await ensureRealDir(home);
@@ -126,30 +128,68 @@ async function syncProfile(accountId: string): Promise<string> {
     await fs.mkdir(target, { recursive: true });
     await ensureLink(path.join(cli, name), target);
   }
-  await syncSettings(cli);
+  await syncSettings(cli, orchestratorOverride);
   return home;
 }
 
+function applyOrchestratorOverride(
+  raw: string,
+  override: OrchestratorChoice,
+): string {
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1).trim() : raw.trim();
+  const base: Record<string, unknown> = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  const existing =
+    base.orchestrator && typeof base.orchestrator === "object" && !Array.isArray(base.orchestrator)
+      ? { ...(base.orchestrator as Record<string, unknown>) }
+      : {};
+  if (override.planner) existing.planner = override.planner;
+  else delete existing.planner;
+  if (override.executor) existing.executor = override.executor;
+  else delete existing.executor;
+  if (Object.keys(existing).length > 0) base.orchestrator = existing;
+  else delete base.orchestrator;
+  return `${JSON.stringify(base, null, 2)}\n`;
+}
+
 /**
- * Copies agy's settings.json into the profile, so every account runs with the same Orchestrator
- * planner and executor and the same preferences. A copy, not a link: agy replaces the file when
- * it saves, which would turn a link into a stale private copy.
+ * Atomically writes agy's settings.json into the profile, merging an optional per-account
+ * Orchestrator override. A copy (via temp + rename), not a link: agy replaces the file when it
+ * saves, and atomic replacement avoids a running agy process ever reading a truncated file.
  */
-async function syncSettings(cli: string): Promise<void> {
+async function syncSettings(cli: string, orchestratorOverride?: OrchestratorChoice | null): Promise<void> {
   const target = path.join(cli, "settings.json");
+  let body: string | null = null;
   try {
-    await fs.copyFile(REAL_SETTINGS_FILE, target);
-    await fs.chmod(target, 0o600).catch(() => undefined);
+    body = await fs.readFile(REAL_SETTINGS_FILE, "utf8");
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
+    body = null;
+  }
+  if (orchestratorOverride) {
+    try {
+      body = applyOrchestratorOverride(body ?? "{}", orchestratorOverride);
+    } catch {
+      // Keep raw file if user's settings.json is malformed rather than breaking launch.
+    }
+  }
+  if (body === null) {
     // No settings of its own: a stale copy must not keep an old choice alive.
     await fs.rm(target, { force: true });
+    return;
+  }
+  const temp = `${target}.paseo-${process.pid}-${Date.now()}-${++settingsSeq}.tmp`;
+  try {
+    await fs.writeFile(temp, body, { mode: 0o600 });
+    await fs.rename(temp, target);
+  } catch (error) {
+    await fs.rm(temp, { force: true }).catch(() => undefined);
+    throw error;
   }
 }
 
 /** Creates or refreshes an account's profile and returns its HOME. Safe to call concurrently. */
-export function ensureProfile(accountId: string): Promise<string> {
-  return withLock(accountId, () => syncProfile(accountId));
+export function ensureProfile(accountId: string, orchestratorOverride?: OrchestratorChoice | null): Promise<string> {
+  return withLock(accountId, () => syncProfile(accountId, orchestratorOverride));
 }
 
 /**
@@ -224,7 +264,7 @@ function candidate(name: string, attempt: number): string {
   return path.join(RECOVERY_DIR, attempt === 1 ? name : `${name} ${attempt}`);
 }
 
-/** The folder a removal would move saved files to, without creating it. */
+/** The folder a removal or recovery would move saved files to, without creating it. */
 export async function recoveryFolder(label: string): Promise<string> {
   const name = folderName(label);
   for (let attempt = 1; ; attempt++) {
@@ -305,6 +345,34 @@ export interface PreservedFiles {
   folder: string;
   /** The moved entries, relative to the profile HOME (and to `folder`). */
   items: string[];
+}
+
+/**
+ * Moves saved files out of a profile HOME into RECOVERY_DIR without removing the account or its
+ * sign-in. Returns null when there were no saved files.
+ */
+export function recoverSavedFiles(accountId: string, label: string): Promise<PreservedFiles | null> {
+  return withLock(accountId, async () => {
+    const home = profileHome(accountId);
+    const items = await savedFiles(accountId);
+    if (!items.length) return null;
+    let folder: string | null = null;
+    const moved: string[] = [];
+    const movedSoFar = () => (folder ? ` Files moved so far are in ${displayPath(folder)}.` : "");
+    for (const item of items) {
+      const source = path.join(home, item);
+      if (!(await profileEntry(accountId, source))) continue;
+      folder ??= await claimRecoveryFolder(label);
+      try {
+        await move(accountId, source, path.join(folder, item));
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`Couldn't move ${item} out of the account's home folder: ${reason}.${movedSoFar()}`);
+      }
+      moved.push(item);
+    }
+    return folder ? { folder, items: moved } : null;
+  });
 }
 
 /**

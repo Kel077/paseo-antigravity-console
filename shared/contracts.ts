@@ -25,6 +25,17 @@ export function accountIdFromMetadata(metadata: Readonly<Record<string, unknown>
   return typeof value === "string" && value.length > 0 ? value : SYSTEM_ACCOUNT_ID;
 }
 
+/** Quota pool a model draws from. */
+export const quotaPoolSchema = z.enum(["gemini", "third-party", "all"]);
+export type QuotaPool = z.infer<typeof quotaPoolSchema>;
+
+/** Infers which agy quota pool a model id or label uses. */
+export function quotaPoolForModel(model: string | null | undefined): "gemini" | "third-party" {
+  const name = (model ?? "").trim().toLowerCase().replace(/^antigravity\//, "");
+  if (name.startsWith("claude") || name.startsWith("gpt")) return "third-party";
+  return "gemini";
+}
+
 export const accountIdSchema = z
   .string()
   .regex(/^(default|a[0-9a-f]{8})$/, "Unknown account id");
@@ -63,6 +74,22 @@ export const accountStatusSchema = z.enum([
   "error",
 ]);
 
+export const failureReasonSchema = z.enum(["quota", "auth", "transient", "error"]);
+export type FailureReason = z.infer<typeof failureReasonSchema>;
+
+export const accountCooldownSchema = z.object({
+  pool: quotaPoolSchema,
+  reason: failureReasonSchema,
+  until: z.string(),
+});
+export type AccountCooldown = z.infer<typeof accountCooldownSchema>;
+
+export const orchestratorChoiceSchema = z.object({
+  planner: z.string().nullable(),
+  executor: z.string().nullable(),
+});
+export type OrchestratorChoice = z.infer<typeof orchestratorChoiceSchema>;
+
 export const accountSummarySchema = z.object({
   id: accountIdSchema,
   label: z.string(),
@@ -73,6 +100,8 @@ export const accountSummarySchema = z.object({
   status: accountStatusSchema,
   /** Google account email from agy's log, when known. */
   email: z.string().nullable(),
+  /** The account's Google AI plan as agy names it, for example "Google AI Pro"; null until known. */
+  plan: z.string().nullable(),
   /** Human-readable reason for status "error" or "signed-out", or a safety warning. */
   statusDetail: z.string().nullable(),
   /** ISO timestamp of the last status check. */
@@ -82,23 +111,35 @@ export const accountSummarySchema = z.object({
   createdAt: z.string().nullable(),
   /** False when the plugin found credentials stored outside the profile and refuses to launch it. */
   usable: z.boolean(),
+  /** Whether automatic fallback may route turns onto this account. */
+  fallbackEnabled: z.boolean(),
+  /** Active fallback cooldowns on this account (by quota pool or whole account). */
+  cooldowns: z.array(accountCooldownSchema),
+  /** Per-account Orchestrator override for profile accounts; null inherits the global choice. */
+  orchestratorOverride: orchestratorChoiceSchema.nullable(),
 });
 
 export type AccountSummary = z.infer<typeof accountSummarySchema>;
 export type QuotaGroup = z.infer<typeof quotaGroupSchema>;
 export type QuotaBucket = z.infer<typeof quotaBucketSchema>;
 
+/** Strategy used when picking the next account for fallback (or smart routing). */
+export const fallbackStrategySchema = z.enum(["order", "quota", "reset"]);
+export type FallbackStrategy = z.infer<typeof fallbackStrategySchema>;
+
 /** Automatic account fallback when an Antigravity turn fails. */
 export const fallbackSettingsSchema = z.object({
   enabled: z.boolean(),
   /** Retries on the same account for errors that may pass (network, 5xx, unknown) before moving on. */
   retries: z.number().int().min(0).max(3),
+  /** order: list order; quota: highest remaining quota for the model's pool; reset: soonest reset with quota left. */
+  strategy: fallbackStrategySchema,
 });
 
 export type FallbackSettings = z.infer<typeof fallbackSettingsSchema>;
 
 export const accountsStateSchema = z.object({
-  /** System account first, then profile accounts in creation order. */
+  /** Accounts in configured fallback priority order. */
   accounts: z.array(accountSummarySchema),
   defaultAccountId: accountIdSchema,
   /** Resolved agy executable, or null when it was not found. */
@@ -150,6 +191,39 @@ export const setDefaultAccountRpc = defineRpc({
   output: accountsStateSchema,
 });
 
+/** Moves an account up or down in the list and fallback priority order. */
+export const moveAccountRpc = defineRpc({
+  name: "accounts.move",
+  input: z
+    .object({
+      accountId: accountIdSchema,
+      direction: z.enum(["up", "down"]),
+    })
+    .strict(),
+  output: accountsStateSchema,
+});
+
+/** Updates per-account options: whether fallback may use it, and optional Orchestrator override. */
+export const setAccountOptionsRpc = defineRpc({
+  name: "accounts.set-options",
+  input: z
+    .object({
+      accountId: accountIdSchema,
+      fallbackEnabled: z.boolean().optional(),
+      /** Pass null to inherit the global Orchestrator setting, or `{ planner, executor }` to override. */
+      orchestratorOverride: orchestratorChoiceSchema.nullable().optional(),
+    })
+    .strict(),
+  output: accountsStateSchema,
+});
+
+/** Clears active fallback cooldowns on an account (or all accounts when omitted). */
+export const clearCooldownRpc = defineRpc({
+  name: "accounts.clear-cooldown",
+  input: z.object({ accountId: accountIdSchema.optional() }).strict(),
+  output: accountsStateSchema,
+});
+
 /** The folder in the daemon user's home that receives a removed account's saved files. */
 export const RECOVERY_FOLDER_NAME = "Antigravity Console";
 
@@ -162,11 +236,18 @@ export const savedFilesSchema = z.object({
 });
 export type SavedFiles = z.infer<typeof savedFilesSchema>;
 
-/** Lists what removing a profile account would move out of its home folder. */
+/** Lists what removing or recovering a profile account would move out of its home folder. */
 export const savedFilesRpc = defineRpc({
   name: "accounts.saved-files",
   input: z.object({ accountId: accountIdSchema }).strict(),
   output: savedFilesSchema,
+});
+
+/** Moves saved files out of a profile account's home folder without removing the account. */
+export const recoverSavedFilesRpc = defineRpc({
+  name: "accounts.recover-files",
+  input: z.object({ accountId: accountIdSchema }).strict(),
+  output: z.object({ moved: savedFilesSchema.nullable() }),
 });
 
 /**
@@ -242,7 +323,26 @@ export const switchAgentAccountRpc = defineRpc({
   }),
 });
 
-/** Pushes `{ revision }` whenever the account list, a status, or a default changes. */
+/** Moves multiple Antigravity agents from one account to another. */
+export const migrateAccountAgentsRpc = defineRpc({
+  name: "agents.migrate-account",
+  input: z
+    .object({
+      fromAccountId: accountIdSchema,
+      toAccountId: accountIdSchema,
+      mode: z.enum(["idle-only", "after-turn", "now"]).default("after-turn"),
+    })
+    .strict(),
+  output: z.object({
+    switched: z.number().int().nonnegative(),
+    scheduled: z.number().int().nonnegative(),
+    skipped: z.number().int().nonnegative(),
+    failed: z.array(z.object({ agentId: z.string(), title: z.string().nullable(), error: z.string() })),
+    targetLabel: z.string(),
+  }),
+});
+
+/** Pushes `{ revision }` whenever the account list, a status, cooldown, or a default changes. */
 export const watchAccountsSubscription = defineSubscription({
   name: "accounts.watch",
   input: empty,
@@ -283,7 +383,10 @@ export const contextUsageRpc = defineRpc({
 export const statsRangeSchema = z.enum(["24h", "7d", "30d"]);
 export type StatsRange = z.infer<typeof statsRangeSchema>;
 
-/** Token and timing sums for a set of model calls; ratios are derived by the client. */
+export const statsScopeSchema = z.enum(["all", "main", "subagent"]);
+export type StatsScope = z.infer<typeof statsScopeSchema>;
+
+/** Token, timing, and estimated API cost sums for a set of model calls; ratios are derived by the client. */
 export const usageTotalsSchema = z.object({
   requests: z.number().int().nonnegative(),
   input: z.number().nonnegative(),
@@ -293,29 +396,116 @@ export const usageTotalsSchema = z.object({
   generationSeconds: z.number().nonnegative(),
   /** Seconds from request to first token, summed. */
   firstTokenSeconds: z.number().nonnegative(),
+  /** Estimated API cost in USD across priced requests. */
+  cost: z.number().nonnegative(),
+  /** Number of requests that matched an official or custom price entry. */
+  pricedRequests: z.number().int().nonnegative(),
 });
 
 export type UsageTotals = z.infer<typeof usageTotalsSchema>;
 
+export const usageAccountBreakdownSchema = usageTotalsSchema.extend({
+  accountId: z.string(),
+  label: z.string(),
+  conversations: z.number().int().nonnegative(),
+});
+
 export const usageStatsSchema = z.object({
   range: statsRangeSchema,
-  /** Start of each bin in ms since epoch; bins are contiguous and the last one contains "now". */
+  /** Nominal bin duration in ms (DST days may be 23h or 25h; each bin carries its exact start/end). */
   binMs: z.number().int().positive(),
-  bins: z.array(usageTotalsSchema.extend({ start: z.number() })),
+  bins: z.array(usageTotalsSchema.extend({ start: z.number(), end: z.number() })),
   totals: usageTotalsSchema,
+  /** Split between main conversations and subagent conversations in the selected range/account. */
+  breakdown: z.object({
+    main: usageTotalsSchema,
+    subagent: usageTotalsSchema,
+  }),
   /** Per model label as agy shows it, most requests first. */
-  models: z.array(usageTotalsSchema.extend({ label: z.string() })),
+  models: z.array(usageTotalsSchema.extend({ label: z.string(), pricingKey: z.string() })),
+  /** Per attributed account (only conversations launched while this plugin observed them carry an account id). */
+  accounts: z.array(usageAccountBreakdownSchema),
   conversations: z.number().int().nonnegative(),
+  /** True when at least one custom price override is currently configured. */
+  hasCustomPricing: z.boolean(),
   generatedAt: z.string(),
 });
 
 export type UsageStats = z.infer<typeof usageStatsSchema>;
 
-/** Usage of every Antigravity conversation on this host (all accounts share the store). */
+/** Usage of Antigravity conversations on this host, filterable by scope, account, and model. */
 export const usageStatsRpc = defineRpc({
   name: "stats.usage",
-  input: z.object({ range: statsRangeSchema }).strict(),
+  input: z
+    .object({
+      range: statsRangeSchema,
+      scope: statsScopeSchema.optional(),
+      accountId: z.string().min(1).max(40).optional(),
+      model: z.string().min(1).max(120).optional(),
+    })
+    .strict(),
   output: usageStatsSchema,
+});
+
+// ---- API Pricing ---------------------------------------------------------------------------
+
+const rateNumber = z.number().finite().min(0).max(10_000);
+
+export const modelRatesSchema = z.object({
+  input: rateNumber,
+  cached: rateNumber,
+  output: rateNumber,
+  longContextThreshold: z.number().int().positive().max(10_000_000).optional(),
+  longInput: rateNumber.optional(),
+  longCached: rateNumber.optional(),
+  longOutput: rateNumber.optional(),
+});
+
+export const pricingModelRowSchema = z.object({
+  key: z.string().min(1).max(120),
+  label: z.string().min(1).max(120),
+  provider: z.string().nullable(),
+  /** Official rates effective right now, or null for custom/unrecognized models. */
+  official: modelRatesSchema.nullable(),
+  /** User-configured override rates, or null when using official defaults. */
+  custom: modelRatesSchema.nullable(),
+  /** Effective rates currently used for estimation, or null when unpriced. */
+  effective: modelRatesSchema.nullable(),
+  /** Optional note about official scheduled or tiered rates. */
+  note: z.string().nullable(),
+  /** True when this model appeared in recent local conversations. */
+  seenLocally: z.boolean(),
+});
+
+export type PricingModelRow = z.infer<typeof pricingModelRowSchema>;
+
+export const pricingStateSchema = z.object({
+  models: z.array(pricingModelRowSchema),
+  /** Raw custom overrides map so clients (e.g. subagent views) can also estimate costs locally. */
+  overrides: z.record(z.string(), modelRatesSchema),
+});
+
+export type PricingState = z.infer<typeof pricingStateSchema>;
+
+export const getPricingRpc = defineRpc({
+  name: "pricing.get",
+  input: empty,
+  output: pricingStateSchema,
+});
+
+export const setPricingRpc = defineRpc({
+  name: "pricing.set",
+  input: z
+    .object({
+      /** Model pricing family key (e.g. "gemini-4-neon"). Required unless resetAll is true. */
+      key: z.string().trim().min(1).max(120).optional(),
+      /** Custom rates in USD per 1M tokens, or null to restore the official default for `key`. */
+      rates: modelRatesSchema.nullable().optional(),
+      /** When true, clears all custom overrides and restores official API pricing. */
+      resetAll: z.boolean().optional(),
+    })
+    .strict(),
+  output: pricingStateSchema,
 });
 
 export const setFallbackRpc = defineRpc({
@@ -330,7 +520,7 @@ export const FALLBACK_TIMELINE_KIND = "antigravity-fallback";
 export const fallbackEventSchema = z.object({
   event: z.enum(["retry", "switch", "exhausted"]),
   /** quota: limit reached; auth: sign-in rejected; transient: may pass; error: anything else. */
-  reason: z.enum(["quota", "auth", "transient", "error"]),
+  reason: failureReasonSchema,
   from: z.string(),
   to: z.string().nullable(),
   attempt: z.number().int().nonnegative(),
@@ -368,9 +558,11 @@ export const modelFamilySchema = z.object({
 export type ModelFamily = z.infer<typeof modelFamilySchema>;
 
 export const orchestratorStateSchema = z.object({
-  /** Saved planner label, or null for agy's default. */
+  /** Saved global planner label, or null for agy's default. */
   planner: z.string().nullable(),
   executor: z.string().nullable(),
+  /** Per-account overrides keyed by accountId (only profile accounts with an explicit override). */
+  overrides: z.record(z.string(), orchestratorChoiceSchema),
   planners: z.array(modelFamilySchema),
   executors: z.array(modelFamilySchema),
   /** Why the model lists could not be read, when they could not. */
@@ -390,6 +582,10 @@ export const setOrchestratorRpc = defineRpc({
     .object({
       planner: z.string().min(1).max(80).nullable().optional(),
       executor: z.string().min(1).max(80).nullable().optional(),
+      /** When set to a profile account id, saves an override for that account instead of global settings.json. */
+      accountId: accountIdSchema.optional(),
+      /** When true with accountId, clears that account's override so it inherits the global choice. */
+      inheritGlobal: z.boolean().optional(),
       /** Agent to reopen with the new choice: now when idle, after its turn when running. */
       applyTo: z.string().min(1).max(200).optional(),
     })
@@ -473,11 +669,23 @@ export const transcriptEntrySchema = z.object({
 });
 export type TranscriptEntry = z.infer<typeof transcriptEntrySchema>;
 
+export const subagentArtifactInfoSchema = z.object({
+  /** Relative path under the subagent's brain directory. */
+  path: z.string(),
+  name: z.string(),
+  size: z.number().int().nonnegative(),
+  updatedAt: z.string(),
+  isMarkdown: z.boolean(),
+});
+export type SubagentArtifactInfo = z.infer<typeof subagentArtifactInfoSchema>;
+
 export const subagentDetailSchema = z.object({
   summary: subagentSummarySchema.nullable(),
   entries: z.array(transcriptEntrySchema),
   /** The report it sent to its parent, in full. */
   report: z.string().nullable(),
+  /** Artifacts written by the subagent inside its brain directory. */
+  artifacts: z.array(subagentArtifactInfoSchema),
   /** True when older entries were left out. */
   truncated: z.boolean(),
 });
@@ -492,6 +700,23 @@ export const subagentDetailRpc = defineRpc({
     })
     .strict(),
   output: subagentDetailSchema,
+});
+
+export const subagentArtifactRpc = defineRpc({
+  name: "subagents.artifact",
+  input: z
+    .object({
+      agentId: z.string().min(1).max(200),
+      subagentId: z.string().regex(/^[0-9a-f-]{36}$/i),
+      path: z.string().min(1).max(300),
+    })
+    .strict(),
+  output: z.object({
+    path: z.string(),
+    content: z.string(),
+    truncated: z.boolean(),
+    isMarkdown: z.boolean(),
+  }),
 });
 
 export const SUBAGENT_TIMELINE_KIND = "antigravity-subagent";

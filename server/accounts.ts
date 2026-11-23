@@ -1,25 +1,28 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import {
   SYSTEM_ACCOUNT_ID,
+  type AccountCooldown,
   type AccountSummary,
   type AccountsState,
   type FallbackSettings,
+  type OrchestratorChoice,
   type QuotaGroup,
   type SavedFiles,
 } from "../shared/contracts";
-import { agyVersion, probeAccount, readAccountEmail } from "./agy";
-import fs from "node:fs/promises";
-import path from "node:path";
+import { agyVersion, probeAccount, readAccountEmail, readPlan, type AccountPlan } from "./agy";
 import { dataDir, displayPath, profileHome, resolveAgy } from "./paths";
 import {
   deleteSignIn,
   ensureProfile,
+  recoverSavedFiles,
   recoveryFolder,
   removeProfile,
   savedFiles,
   scanAfterSignIn,
 } from "./profile";
 import { SignInManager } from "./signin";
-import { AccountStore, type StoredAccount } from "./store";
+import { AccountStore, orderedAccountIds, type StoredAccount } from "./store";
 
 const statusFile = () => path.join(dataDir(), "status.json");
 
@@ -28,17 +31,41 @@ interface RuntimeStatus {
   statusDetail: string | null;
   checkedAt: string | null;
   quota: QuotaGroup[] | null;
+  /** The plan agy reported, and when it was last asked. */
+  plan: AccountPlan | null;
+  planCheckedAt: string | null;
 }
 
-const UNKNOWN: RuntimeStatus = { status: "unknown", statusDetail: null, checkedAt: null, quota: null };
+const UNKNOWN: RuntimeStatus = {
+  status: "unknown",
+  statusDetail: null,
+  checkedAt: null,
+  quota: null,
+  plan: null,
+  planCheckedAt: null,
+};
+
+/** Plans rarely change: ask again after this long, or sooner while none is known. */
+const PLAN_MAX_AGE_MS = 6 * 60 * 60_000;
+const PLAN_RETRY_MS = 30 * 60_000;
+
+export interface StatusUpdateEvent {
+  accountId: string;
+  status: AccountSummary["status"];
+  quota: QuotaGroup[] | null;
+  signedInChanged: boolean;
+}
 
 /** Owns the account list, sign-in state, and change notifications. */
 export class AccountService {
   readonly store = new AccountStore();
   readonly signIns = new SignInManager();
   private readonly runtime = new Map<string, RuntimeStatus>();
-  private readonly probing = new Map<string, Promise<void>>();
+  private readonly probing = new Map<string, { epoch: number; task: Promise<void> }>();
+  private readonly epochs = new Map<string, number>();
   private readonly listeners = new Set<(revision: number) => void>();
+  private readonly statusListeners = new Set<(event: StatusUpdateEvent) => void>();
+  private cooldownProvider: (accountId: string) => AccountCooldown[] = () => [];
   /** Starts from the clock so it keeps increasing across daemon and plugin restarts. */
   private revision = Date.now();
   private agyPath: string | null = null;
@@ -47,6 +74,8 @@ export class AccountService {
 
   private initialized: Promise<void> | null = null;
   private saveTimer: NodeJS.Timeout | null = null;
+  private statusWriting: Promise<void> = Promise.resolve();
+  private statusWriteSeq = 0;
 
   /** Loads the account list and the last known statuses, so a restart shows quota at once. */
   init(): Promise<void> {
@@ -55,7 +84,8 @@ export class AccountService {
       try {
         const raw = JSON.parse(await fs.readFile(statusFile(), "utf8")) as Record<string, RuntimeStatus>;
         for (const [id, status] of Object.entries(raw)) {
-          if (id === SYSTEM_ACCOUNT_ID || this.store.get(id)) this.runtime.set(id, status);
+          // Older caches have no plan fields.
+          if (id === SYSTEM_ACCOUNT_ID || this.store.get(id)) this.runtime.set(id, { ...UNKNOWN, ...status });
         }
       } catch {
         // No cache yet.
@@ -64,19 +94,43 @@ export class AccountService {
     return this.initialized;
   }
 
+  private bumpEpoch(accountId: string): number {
+    const next = (this.epochs.get(accountId) ?? 0) + 1;
+    this.epochs.set(accountId, next);
+    return next;
+  }
+
+  private epochOf(accountId: string): number {
+    return this.epochs.get(accountId) ?? 0;
+  }
+
+  private exists(accountId: string): boolean {
+    return accountId === SYSTEM_ACCOUNT_ID || Boolean(this.store.get(accountId));
+  }
+
   private saveStatuses(): void {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
-      const file = statusFile();
-      const temp = `${file}.${process.pid}.tmp`;
       const body = JSON.stringify(Object.fromEntries(this.runtime), null, 1);
-      void fs
-        .mkdir(path.dirname(file), { recursive: true })
-        .then(() => fs.writeFile(temp, body, { mode: 0o600 }))
-        .then(() => fs.rename(temp, file))
-        .catch((error: unknown) => console.error("antigravity-accounts: could not save statuses", error));
+      const file = statusFile();
+      const seq = ++this.statusWriteSeq;
+      const temp = `${file}.${process.pid}.${Date.now()}.${seq}.tmp`;
+      this.statusWriting = this.statusWriting
+        .then(async () => {
+          await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+          await fs.writeFile(temp, body, { mode: 0o600 });
+          await fs.rename(temp, file);
+        })
+        .catch(async (error: unknown) => {
+          await fs.rm(temp, { force: true }).catch(() => undefined);
+          console.error("antigravity-accounts: could not save statuses", error);
+        });
     }, 1000);
+  }
+
+  setCooldownProvider(provider: (accountId: string) => AccountCooldown[]): void {
+    this.cooldownProvider = provider;
   }
 
   onChange(listener: (revision: number) => void): () => void {
@@ -84,8 +138,18 @@ export class AccountService {
     return () => this.listeners.delete(listener);
   }
 
+  onStatusUpdated(listener: (event: StatusUpdateEvent) => void): () => void {
+    this.statusListeners.add(listener);
+    return () => this.statusListeners.delete(listener);
+  }
+
   currentRevision(): number {
     return this.revision;
+  }
+
+  /** Publishes a revision bump (e.g. when a cooldown is set or cleared). */
+  notifyChange(): void {
+    this.changed();
   }
 
   private changed(): void {
@@ -96,6 +160,16 @@ export class AccountService {
         listener(this.revision);
       } catch (error) {
         console.error("antigravity-accounts: change listener failed", error);
+      }
+    }
+  }
+
+  private emitStatus(event: StatusUpdateEvent): void {
+    for (const listener of this.statusListeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        console.error("antigravity-accounts: status listener failed", error);
       }
     }
   }
@@ -137,15 +211,40 @@ export class AccountService {
     return this.store.get(accountId)?.label ?? accountId;
   }
 
-  /** Re-checks sign-in and quota for one account. Concurrent calls share one probe. */
-  refreshOne(accountId: string): Promise<void> {
+  /** Ensures a profile account's HOME and settings.json (with any per-account Orchestrator override). */
+  async ensureAccountProfile(accountId: string): Promise<string | null> {
+    if (accountId === SYSTEM_ACCOUNT_ID) return null;
+    const account = this.store.get(accountId);
+    if (!account) return null;
+    return ensureProfile(accountId, account.orchestrator);
+  }
+
+  /** Re-syncs settings.json into every existing profile (e.g. after global Orchestrator settings change). */
+  async syncAllProfiles(): Promise<void> {
+    const accounts = this.store.snapshot().accounts;
+    await Promise.all(
+      accounts.map((account) =>
+        ensureProfile(account.id, account.orchestrator).catch((error: unknown) => {
+          console.error(`antigravity-accounts: could not sync settings for ${account.id}`, error);
+        }),
+      ),
+    );
+  }
+
+  /** Re-checks sign-in and quota for one account. Concurrent calls of the same epoch share one probe. */
+  refreshOne(accountId: string, options?: { forcePlan?: boolean }): Promise<void> {
+    const epoch = this.epochOf(accountId);
     const running = this.probing.get(accountId);
-    if (running) return running;
+    if (running && running.epoch === epoch && !options?.forcePlan) return running.task;
     const task = (async () => {
+      if (!this.exists(accountId)) return;
       const agy = await this.agy();
       const checkedAt = new Date().toISOString();
+      const previous = this.runtime.get(accountId) ?? UNKNOWN;
       if (!agy) {
+        if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
         this.runtime.set(accountId, {
+          ...previous,
           status: "error",
           statusDetail: "agy was not found on this host",
           checkedAt,
@@ -153,16 +252,51 @@ export class AccountService {
         });
         return;
       }
-      if (accountId !== SYSTEM_ACCOUNT_ID) await ensureProfile(accountId);
+      if (accountId !== SYSTEM_ACCOUNT_ID) {
+        if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
+        await this.ensureAccountProfile(accountId);
+      }
       const result = await probeAccount(agy, accountId);
-      const email = await readAccountEmail(accountId);
-      this.runtime.set(accountId, {
+      if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
+      const email = result.kind === "signed-in" ? await readAccountEmail(accountId) : null;
+      const knownEmail =
+        accountId === SYSTEM_ACCOUNT_ID ? this.store.snapshot().systemEmail : (this.store.get(accountId)?.email ?? null);
+      let { plan, planCheckedAt } = previous;
+      if (result.kind === "signed-out") {
+        plan = null;
+        planCheckedAt = null;
+      } else if (result.kind === "signed-in") {
+        // Another Google account signed in here: the old plan no longer applies.
+        const otherAccount = email !== null && knownEmail !== null && email !== knownEmail;
+        const age = planCheckedAt ? Date.now() - Date.parse(planCheckedAt) : Infinity;
+        const shouldCheckPlan =
+          otherAccount ||
+          (options?.forcePlan && !plan) ||
+          age > (plan ? PLAN_MAX_AGE_MS : PLAN_RETRY_MS);
+        if (shouldCheckPlan) {
+          const read = await readPlan(agy, accountId).catch(() => null);
+          if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
+          if (read) {
+            plan = read;
+            planCheckedAt = new Date().toISOString();
+          } else {
+            plan = otherAccount ? null : plan;
+            // When the user explicitly refreshed and plan is still missing, do not lock out another manual retry.
+            planCheckedAt = options?.forcePlan && !plan ? null : new Date().toISOString();
+          }
+        }
+      }
+      if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
+      const nextStatus: RuntimeStatus = {
         status: result.kind,
         statusDetail: result.kind === "signed-in" ? null : result.detail,
         checkedAt,
         quota: result.kind === "signed-in" ? result.quota : null,
-      });
-      if (email) {
+        plan,
+        planCheckedAt,
+      };
+      this.runtime.set(accountId, nextStatus);
+      if (result.kind === "signed-in" && email && email !== knownEmail) {
         await this.store.update((data) => {
           if (accountId === SYSTEM_ACCOUNT_ID) data.systemEmail = email;
           else {
@@ -170,10 +304,23 @@ export class AccountService {
             if (account) account.email = email;
           }
         });
+      } else if (result.kind === "signed-out" && accountId !== SYSTEM_ACCOUNT_ID && knownEmail !== null) {
+        await this.store.update((data) => {
+          const account = data.accounts.find((entry) => entry.id === accountId);
+          if (account) account.email = null;
+        });
       }
+      this.emitStatus({
+        accountId,
+        status: result.kind,
+        quota: nextStatus.quota,
+        signedInChanged: previous.status !== result.kind,
+      });
     })()
       .catch((error: unknown) => {
+        if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
         this.runtime.set(accountId, {
+          ...(this.runtime.get(accountId) ?? UNKNOWN),
           status: "error",
           statusDetail: error instanceof Error ? error.message : String(error),
           checkedAt: new Date().toISOString(),
@@ -181,17 +328,17 @@ export class AccountService {
         });
       })
       .finally(() => {
-        this.probing.delete(accountId);
-        this.changed();
+        if (this.probing.get(accountId)?.task === task) this.probing.delete(accountId);
+        if (this.exists(accountId)) this.changed();
       });
-    this.probing.set(accountId, task);
+    this.probing.set(accountId, { epoch, task });
     return task;
   }
 
-  async refreshAll(): Promise<void> {
+  async refreshAll(options?: { forcePlan?: boolean }): Promise<void> {
     await this.agy(true);
-    const ids = [SYSTEM_ACCOUNT_ID, ...this.store.snapshot().accounts.map((account) => account.id)];
-    await Promise.all(ids.map((id) => this.refreshOne(id)));
+    const ids = orderedAccountIds(this.store.snapshot());
+    await Promise.all(ids.map((id) => this.refreshOne(id, options)));
   }
 
   /** Last known status without probing. */
@@ -216,38 +363,52 @@ export class AccountService {
       data.defaultAccountId === SYSTEM_ACCOUNT_ID ||
       data.accounts.some((account) => account.id === data.defaultAccountId);
     const defaultAccountId = defaultExists ? data.defaultAccountId : SYSTEM_ACCOUNT_ID;
+    const byId = new Map<string, AccountSummary>();
+
     const system = this.runtime.get(SYSTEM_ACCOUNT_ID) ?? UNKNOWN;
-    const accounts: AccountSummary[] = [
-      {
-        id: SYSTEM_ACCOUNT_ID,
-        label: data.systemLabel,
-        kind: "system",
-        isDefaultForNewAgents: defaultAccountId === SYSTEM_ACCOUNT_ID,
-        status: system.status,
-        email: data.systemEmail,
-        statusDetail: system.statusDetail,
-        checkedAt: system.checkedAt,
-        quota: system.quota,
-        createdAt: null,
-        usable: true,
-      },
-      ...data.accounts.map((account): AccountSummary => {
-        const status = this.runtime.get(account.id) ?? UNKNOWN;
-        return {
-          id: account.id,
-          label: account.label,
-          kind: "profile",
-          isDefaultForNewAgents: defaultAccountId === account.id,
-          status: status.status,
-          email: account.email,
-          statusDetail: account.unsafeDetail ?? status.statusDetail,
-          checkedAt: status.checkedAt,
-          quota: status.quota,
-          createdAt: account.createdAt,
-          usable: account.unsafeDetail === null,
-        };
-      }),
-    ];
+    byId.set(SYSTEM_ACCOUNT_ID, {
+      id: SYSTEM_ACCOUNT_ID,
+      label: data.systemLabel,
+      kind: "system",
+      isDefaultForNewAgents: defaultAccountId === SYSTEM_ACCOUNT_ID,
+      status: system.status,
+      email: data.systemEmail,
+      plan: system.plan?.name ?? null,
+      statusDetail: system.statusDetail,
+      checkedAt: system.checkedAt,
+      quota: system.quota,
+      createdAt: null,
+      usable: true,
+      fallbackEnabled: data.systemFallbackEnabled,
+      cooldowns: this.cooldownProvider(SYSTEM_ACCOUNT_ID),
+      orchestratorOverride: null,
+    });
+
+    for (const account of data.accounts) {
+      const status = this.runtime.get(account.id) ?? UNKNOWN;
+      byId.set(account.id, {
+        id: account.id,
+        label: account.label,
+        kind: "profile",
+        isDefaultForNewAgents: defaultAccountId === account.id,
+        status: status.status,
+        email: status.status === "signed-out" ? null : account.email,
+        plan: status.plan?.name ?? null,
+        statusDetail: account.unsafeDetail ?? status.statusDetail,
+        checkedAt: status.checkedAt,
+        quota: status.quota,
+        createdAt: account.createdAt,
+        usable: account.unsafeDetail === null,
+        fallbackEnabled: account.fallbackEnabled,
+        cooldowns: this.cooldownProvider(account.id),
+        orchestratorOverride: account.orchestrator,
+      });
+    }
+
+    const accounts = orderedAccountIds(data)
+      .map((id) => byId.get(id))
+      .filter((entry): entry is AccountSummary => Boolean(entry));
+
     return {
       accounts,
       defaultAccountId,
@@ -296,9 +457,14 @@ export class AccountService {
         email: null,
         credentialFiles: [],
         unsafeDetail: null,
+        fallbackEnabled: true,
+        orchestrator: null,
       });
+      const order = orderedAccountIds(data);
+      if (!order.includes(id)) order.push(id);
+      data.order = order;
     });
-    await ensureProfile(id);
+    await this.ensureAccountProfile(id);
     this.runtime.set(id, { ...UNKNOWN, status: "signed-out", statusDetail: "Not signed in yet" });
     this.changed();
     const created = (await this.state()).accounts.find((account) => account.id === id);
@@ -318,6 +484,46 @@ export class AccountService {
     this.changed();
   }
 
+  async move(accountId: string, direction: "up" | "down"): Promise<void> {
+    this.requireAccount(accountId);
+    await this.store.update((data) => {
+      const order = orderedAccountIds(data);
+      const index = order.indexOf(accountId);
+      if (index < 0) return;
+      const target = direction === "up" ? index - 1 : index + 1;
+      if (target < 0 || target >= order.length) return;
+      const swapped = order[target]!;
+      order[target] = order[index]!;
+      order[index] = swapped;
+      data.order = order;
+    });
+    this.changed();
+  }
+
+  async setAccountOptions(
+    accountId: string,
+    patch: { fallbackEnabled?: boolean; orchestratorOverride?: OrchestratorChoice | null },
+  ): Promise<void> {
+    this.requireAccount(accountId);
+    if (accountId === SYSTEM_ACCOUNT_ID && patch.orchestratorOverride !== undefined) {
+      throw new Error("The system account uses the global Orchestrator setting.");
+    }
+    await this.store.update((data) => {
+      if (accountId === SYSTEM_ACCOUNT_ID) {
+        if (patch.fallbackEnabled !== undefined) data.systemFallbackEnabled = patch.fallbackEnabled;
+        return;
+      }
+      const entry = data.accounts.find((candidate) => candidate.id === accountId);
+      if (!entry) return;
+      if (patch.fallbackEnabled !== undefined) entry.fallbackEnabled = patch.fallbackEnabled;
+      if (patch.orchestratorOverride !== undefined) entry.orchestrator = patch.orchestratorOverride;
+    });
+    if (accountId !== SYSTEM_ACCOUNT_ID && patch.orchestratorOverride !== undefined) {
+      await this.ensureAccountProfile(accountId);
+    }
+    this.changed();
+  }
+
   async setDefault(accountId: string): Promise<void> {
     const account = this.requireAccount(accountId);
     if (account?.unsafeDetail) throw new Error(account.unsafeDetail);
@@ -327,7 +533,7 @@ export class AccountService {
     this.changed();
   }
 
-  /** What removing a profile account would move out of its home folder, and to where. */
+  /** What removing or recovering a profile account would move out of its home folder, and to where. */
   async savedFiles(accountId: string): Promise<SavedFiles> {
     const account = this.requireProfileAccount(accountId);
     return {
@@ -336,13 +542,23 @@ export class AccountService {
     };
   }
 
+  /** Moves files agents saved in a profile HOME into ~/Antigravity Console without deleting the account. */
+  async recoverSavedFiles(accountId: string): Promise<SavedFiles | null> {
+    const account = this.requireProfileAccount(accountId);
+    const preserved = await recoverSavedFiles(accountId, account.label);
+    return preserved ? { items: preserved.items, folder: displayPath(preserved.folder) } : null;
+  }
+
   /** Removes a profile account. Returns where its saved files went, or null when it had none. */
   async remove(accountId: string): Promise<SavedFiles | null> {
     const account = this.requireProfileAccount(accountId);
+    this.bumpEpoch(accountId);
+    this.probing.delete(accountId);
     this.signIns.cancelForAccount(accountId);
     const preserved = await removeProfile(accountId, account.label);
     await this.store.update((data) => {
       data.accounts = data.accounts.filter((entry) => entry.id !== accountId);
+      data.order = data.order.filter((id) => id !== accountId);
       if (data.defaultAccountId === accountId) data.defaultAccountId = SYSTEM_ACCOUNT_ID;
     });
     this.runtime.delete(accountId);
@@ -352,6 +568,8 @@ export class AccountService {
 
   async signOut(accountId: string): Promise<void> {
     const account = this.requireProfileAccount(accountId);
+    this.bumpEpoch(accountId);
+    this.probing.delete(accountId);
     await deleteSignIn(accountId, account.credentialFiles);
     await this.store.update((data) => {
       const entry = data.accounts.find((candidate) => candidate.id === accountId);
@@ -362,6 +580,7 @@ export class AccountService {
       }
     });
     this.runtime.set(accountId, { ...UNKNOWN, status: "signed-out", statusDetail: "Signed out" });
+    this.emitStatus({ accountId, status: "signed-out", quota: null, signedInChanged: true });
     this.changed();
     await this.refreshOne(accountId);
   }
@@ -369,7 +588,7 @@ export class AccountService {
   async startSignIn(accountId: string): Promise<{ loginId: string; url: string; expiresAt: string }> {
     this.requireProfileAccount(accountId);
     const agy = await this.requireAgy();
-    await ensureProfile(accountId);
+    await this.ensureAccountProfile(accountId);
     return this.signIns.start(agy, accountId);
   }
 
@@ -380,7 +599,9 @@ export class AccountService {
     const systemEmailBefore = this.store.snapshot().systemEmail;
     const outcome = await this.signIns.submit(loginId, code);
     const scan = await scanAfterSignIn(accountId, outcome.submittedAt);
-    await this.refreshOne(accountId);
+    this.bumpEpoch(accountId);
+    this.probing.delete(accountId);
+    await this.refreshOne(accountId, { forcePlan: true });
     const status = this.runtime.get(accountId);
     let unsafeDetail: string | null = null;
     if (scan.leaked.length > 0) {
@@ -434,5 +655,6 @@ export class AccountService {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.signIns.cancelAll();
     this.listeners.clear();
+    this.statusListeners.clear();
   }
 }

@@ -8,6 +8,7 @@ import type {
 import { useToast, type ToastApi } from "@getpaseo/plugin/client/ui";
 import { useEffect } from "react";
 import {
+  SYSTEM_ACCOUNT_ID,
   accountIdFromMetadata,
   contextUsageRpc,
   getOrchestratorRpc,
@@ -28,7 +29,7 @@ import { ContextPopover, contextStore } from "./context";
 import { percent, tokens } from "./format";
 import { displayLabel } from "./labels";
 import { errorMessage, messages } from "./messages";
-import { shortModelLabel } from "./orchestrator";
+import { resolvePresets, shortModelLabel } from "./orchestrator";
 
 type AgentRow = {
   id: string;
@@ -37,33 +38,61 @@ type AgentRow = {
   metadata?: Readonly<Record<string, unknown>> | null;
   provider: string;
   model?: string | null;
+  title?: string | null;
   status: string;
 };
-type Member = { id: string; workspace: string | null; account: string; running: boolean; model: string | null };
+
+export interface ObservedAgent {
+  id: string;
+  workspace: string | null;
+  account: string;
+  running: boolean;
+  model: string | null;
+  title: string | null;
+}
+
 type OpenSubagents = (agentId: string, workspaceId: string | null | undefined, subagentId?: string) => void;
 
 /** An empty icon that keeps menu labels aligned with the checked one. */
-const BLANK_ICON = { svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M0 0h24v24H0z" fill="none"/></svg>' };
+const BLANK_ICON = {
+  svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M0 0h24v24H0z" fill="none"/></svg>',
+};
+
 type Counts = ReadonlyMap<string, number>;
+type WorkspaceSubagents = ReadonlyMap<string, number>;
 type Timer = ReturnType<typeof setTimeout>;
 
 const CONTEXT_POLL_MS = 5000;
+const IDLE_POLL_MS = 30_000;
+const POLL_BATCH_SIZE = 100;
+
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    result.push(items.slice(index, index + size));
+  }
+  return result;
+}
 
 export function observeAgents(client: PluginClientContext, openSubagents: OpenSubagents) {
   const lifetime = new AbortController();
-  const agents = new Map<string, Member>();
+  const agents = new Map<string, ObservedAgent>();
   const accountPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const contextPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const subagentPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const orchestratorPills = new Map<string, PluginButtonRegistration<PluginText>>();
   const subagentCounts = new Map<string, { total: number; running: number }>();
+  const lastPolledAt = new Map<string, number>();
   let orchestrator: OrchestratorState | undefined;
   const nativeContext = new Set<string>();
   const listeners = new Set<() => void>();
   const presenters = new Map<symbol, ToastApi>();
   let pendingNotice: string | undefined;
   let counts: Counts | null = null;
+  let memberSnapshot: readonly ObservedAgent[] = [];
+  let workspaceSubagents: WorkspaceSubagents = new Map();
   let accounts: AccountsState | undefined;
+  let accountSignature = "";
 
   // Commands have no toast API of their own; mounted plugin surfaces lend theirs.
   function notify(message: string) {
@@ -72,6 +101,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     if (presenter) presenter.show(message, { durationMs: 5000 });
     else pendingNotice = message;
   }
+
   function useNotifications() {
     const toast = useToast();
     useEffect(() => {
@@ -87,16 +117,38 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     }, [toast]);
   }
 
-  const nameOf = (label: string) => displayLabel(label, (key) => client.i18n.t(messages, key));
+  const nameOf = (label: string, kind?: AccountSummary["kind"]) =>
+    displayLabel(label, (key) => client.i18n.t(messages, key), kind);
+
+  function emit() {
+    listeners.forEach((listener) => listener());
+  }
+
+  function publishWorkspaceSubagents() {
+    const next = new Map<string, number>();
+    for (const agent of agents.values()) {
+      if (!agent.workspace) continue;
+      const running = subagentCounts.get(agent.id)?.running ?? 0;
+      if (running > 0) next.set(agent.workspace, (next.get(agent.workspace) ?? 0) + running);
+    }
+    if (
+      workspaceSubagents.size === next.size &&
+      [...next].every(([ws, n]) => workspaceSubagents.get(ws) === n)
+    ) {
+      return;
+    }
+    workspaceSubagents = next;
+    emit();
+  }
 
   async function switchTo(agentId: string, account: AccountSummary, when: "now" | "after-turn") {
     const result = await client.rpc(switchAgentAccountRpc, { agentId, accountId: account.id, when });
-    notify(client.i18n.t(messages, result.result, { label: nameOf(result.accountLabel) }));
+    notify(client.i18n.t(messages, result.result, { label: nameOf(result.accountLabel, account.kind) }));
   }
 
   // ---- Account pill -------------------------------------------------------------------------
 
-  function renderAccountPill(agent: Member) {
+  function renderAccountPill(agent: ObservedAgent) {
     if (!agent.workspace) return;
     const current = accounts?.accounts.find((account) => account.id === agent.account);
     const healthy = !current || (current.usable && current.status !== "signed-out");
@@ -110,9 +162,13 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       return {
         kind: "item",
         id: account.id,
-        title: account.email && !(account.kind === "profile" && account.status === "signed-out")
-          ? `${nameOf(account.label)} · ${account.email}`
-          : nameOf(account.label),
+        title: [
+          nameOf(account.label, account.kind),
+          account.kind === "profile" && account.status === "signed-out" ? null : account.email,
+          account.plan,
+        ]
+          .filter(Boolean)
+          .join(" · "),
         icon: selected ? "Check" : unavailable ? "UserX" : "UserRound",
         disabled: selected || unavailable,
         behavior: agent.running
@@ -137,7 +193,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     const button: PluginButton<PluginText> = {
       icon: healthy ? "UserRound" : "UserX",
       title: healthy ? messages.message("pill") : messages.message("pillSignedOut"),
-      label: current ? nameOf(current.label) : agent.account,
+      label: current ? nameOf(current.label, current.kind) : agent.account,
       behavior: { kind: "menu", items: choices },
     };
     const pill = accountPills.get(agent.id);
@@ -162,7 +218,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     });
   }
 
-  function renderContextPill(agent: Member) {
+  function renderContextPill(agent: ObservedAgent) {
     if (!agent.workspace || nativeContext.has(agent.id)) {
       contextPills.get(agent.id)?.remove();
       contextPills.delete(agent.id);
@@ -186,7 +242,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
 
   // ---- Subagent pill ------------------------------------------------------------------------
 
-  function renderSubagentPill(agent: Member) {
+  function renderSubagentPill(agent: ObservedAgent) {
     const count = subagentCounts.get(agent.id);
     if (!agent.workspace || !count?.total) {
       subagentPills.get(agent.id)?.remove();
@@ -220,7 +276,25 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
 
   // ---- Orchestrator pill --------------------------------------------------------------------
 
-  async function chooseOrchestrator(agent: Member, patch: { planner?: string | null; executor?: string | null }) {
+  function effectiveOrchestrator(agent: ObservedAgent, state: OrchestratorState) {
+    const override = agent.account !== SYSTEM_ACCOUNT_ID ? state.overrides[agent.account] : undefined;
+    const savedPlanner = override ? override.planner : state.planner;
+    const savedExecutor = override ? override.executor : state.executor;
+    const plannerFamily = state.planners.find((family) => family.variants.some((variant) => variant.label === savedPlanner));
+    const executorFamily = state.executors.find((family) => family.variants.some((variant) => variant.label === savedExecutor));
+    return {
+      isOverride: Boolean(override),
+      savedPlanner,
+      savedExecutor,
+      effectivePlanner: plannerFamily && plannerFamily.accounts.includes(agent.account) ? savedPlanner : null,
+      effectiveExecutor: executorFamily && executorFamily.accounts.includes(agent.account) ? savedExecutor : null,
+    };
+  }
+
+  async function chooseOrchestrator(
+    agent: ObservedAgent,
+    patch: { planner?: string | null; executor?: string | null; accountId?: string; inheritGlobal?: boolean },
+  ) {
     try {
       const { state, applied } = await client.rpc(setOrchestratorRpc, { ...patch, applyTo: agent.id });
       orchestrator = state;
@@ -232,18 +306,30 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
   }
 
   function roleMenu(
-    agent: Member,
+    agent: ObservedAgent,
     role: "planner" | "executor",
     families: readonly ModelFamily[],
     saved: string | null,
+    overrideAccountId?: string,
   ): PluginButtonMenuEntry<PluginText>[] {
+    const scope = overrideAccountId ? { accountId: overrideAccountId } : {};
     const entries: PluginButtonMenuEntry<PluginText>[] = families.map((family) => {
-      const choose = (label: string) => ({ kind: "action" as const, onPress: () => chooseOrchestrator(agent, { [role]: label }) });
+      const choose = (label: string) => ({
+        kind: "action" as const,
+        onPress: () => chooseOrchestrator(agent, { ...scope, [role]: label }),
+      });
       const chosen = family.variants.some((variant) => variant.label === saved);
       const missing = !family.accounts.includes(agent.account);
       if (family.variants.length === 1) {
         const only = family.variants[0]!;
-        return { kind: "item", id: family.id, title: only.label, icon: chosen ? "Check" : BLANK_ICON, disabled: missing, behavior: choose(only.label) };
+        return {
+          kind: "item",
+          id: family.id,
+          title: only.label,
+          icon: chosen ? "Check" : BLANK_ICON,
+          disabled: missing,
+          behavior: choose(only.label),
+        };
       }
       return {
         kind: "item",
@@ -269,52 +355,61 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       id: `${role}-default`,
       title: messages.message("orchestrator.default"),
       icon: saved ? BLANK_ICON : "Check",
-      behavior: { kind: "action", onPress: () => chooseOrchestrator(agent, { [role]: null }) },
+      behavior: { kind: "action", onPress: () => chooseOrchestrator(agent, { ...scope, [role]: null }) },
     });
     return entries;
   }
 
-  function renderOrchestratorPill(agent: Member) {
+  function renderOrchestratorPill(agent: ObservedAgent) {
     if (!agent.workspace || !isOrchestratorModel(agent.model) || !orchestrator) {
       orchestratorPills.get(agent.id)?.remove();
       orchestratorPills.delete(agent.id);
       return;
     }
     const state = orchestrator;
-    const plannerFamily = state.planners.find((family) => family.variants.some((variant) => variant.label === state.planner));
-    // A planner this account cannot run falls back to agy's default.
-    const effective = plannerFamily && plannerFamily.accounts.includes(agent.account) ? state.planner : null;
+    const { isOverride, savedPlanner, savedExecutor, effectivePlanner, effectiveExecutor } = effectiveOrchestrator(agent, state);
+    const overrideAccountId = isOverride ? agent.account : undefined;
+    let label: PluginText;
+    if (effectivePlanner && effectiveExecutor) {
+      label = `${shortModelLabel(effectivePlanner)} / ${shortModelLabel(effectiveExecutor)}`;
+    } else if (effectivePlanner) {
+      label = shortModelLabel(effectivePlanner);
+    } else if (effectiveExecutor) {
+      label = `${client.i18n.t(messages, "orchestrator.pillDefault")} / ${shortModelLabel(effectiveExecutor)}`;
+    } else {
+      label = messages.message("orchestrator.pillDefault");
+    }
+
+    const menuItems: PluginButtonMenuEntry<PluginText>[] = [
+      {
+        kind: "item",
+        id: "planner",
+        title: messages.message("orchestrator.planner"),
+        icon: "Sparkles",
+        behavior: { kind: "menu", items: roleMenu(agent, "planner", state.planners, savedPlanner, overrideAccountId) },
+      },
+      {
+        kind: "item",
+        id: "executor",
+        title: messages.message("orchestrator.executor"),
+        icon: "Cpu",
+        behavior: { kind: "menu", items: roleMenu(agent, "executor", state.executors, savedExecutor, overrideAccountId) },
+      },
+      { kind: "separator", id: "separator" },
+      {
+        kind: "item",
+        id: "manage",
+        title: messages.message("orchestrator.manage"),
+        icon: "Settings2",
+        behavior: { kind: "action", onPress: () => client.openScreen({ screenId: "accounts" }) },
+      },
+    ];
+
     const button: PluginButton<PluginText> = {
       icon: "Workflow",
-      title: messages.message("orchestrator.pillTitle"),
-      label: effective ? shortModelLabel(effective) : messages.message("orchestrator.pillDefault"),
-      behavior: {
-        kind: "menu",
-        items: [
-          {
-            kind: "item",
-            id: "planner",
-            title: messages.message("orchestrator.planner"),
-            icon: "Sparkles",
-            behavior: { kind: "menu", items: roleMenu(agent, "planner", state.planners, state.planner) },
-          },
-          {
-            kind: "item",
-            id: "executor",
-            title: messages.message("orchestrator.executor"),
-            icon: "Cpu",
-            behavior: { kind: "menu", items: roleMenu(agent, "executor", state.executors, state.executor) },
-          },
-          { kind: "separator", id: "separator" },
-          {
-            kind: "item",
-            id: "manage",
-            title: messages.message("orchestrator.manage"),
-            icon: "Settings2",
-            behavior: { kind: "action", onPress: () => client.openScreen({ screenId: "accounts" }) },
-          },
-        ],
-      },
+      title: isOverride ? messages.message("orchestrator.pillOverride") : messages.message("orchestrator.pillTitle"),
+      label,
+      behavior: { kind: "menu", items: menuItems },
     };
     const pill = orchestratorPills.get(agent.id);
     if (pill) pill.update(button);
@@ -326,9 +421,9 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     }
   }
 
-  async function readOrchestrator() {
+  async function readOrchestrator(refresh = false) {
     try {
-      orchestrator = await client.rpc(getOrchestratorRpc, {});
+      orchestrator = await client.rpc(getOrchestratorRpc, { refresh });
       agents.forEach(renderOrchestratorPill);
     } catch (error) {
       if (!lifetime.signal.aborted) console.warn("[antigravity-accounts] orchestrator settings unavailable", error);
@@ -338,40 +433,56 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
   const orchestratorTimer = setInterval(() => void readOrchestrator(), 10 * 60_000);
 
   let polling = false;
-  async function pollContext() {
-    const ids = [...agents.values()].filter((agent) => agent.workspace).map((agent) => agent.id);
-    if (polling || lifetime.signal.aborted || ids.length === 0) return;
+  async function pollContext(forceAll = false) {
+    const now = Date.now();
+    const due: string[] = [];
+    for (const agent of agents.values()) {
+      if (!agent.workspace) continue;
+      const prev = lastPolledAt.get(agent.id) ?? 0;
+      const hasRunningSubagents = (subagentCounts.get(agent.id)?.running ?? 0) > 0;
+      if (forceAll || agent.running || hasRunningSubagents || prev === 0 || now - prev >= IDLE_POLL_MS) {
+        due.push(agent.id);
+      }
+    }
+    if (polling || lifetime.signal.aborted || due.length === 0) return;
     polling = true;
     try {
-      const [{ usage, native }, { counts: found }] = await Promise.all([
-        client.rpc(contextUsageRpc, { agentIds: ids }),
-        client.rpc(subagentCountsRpc, { agentIds: ids }).catch(() => ({ counts: {} as Record<string, { total: number; running: number }> })),
-      ]);
-      nativeContext.clear();
-      for (const id of native) nativeContext.add(id);
-      for (const id of ids) contextStore.set(id, usage[id] ?? null);
-      for (const id of ids) {
-        const count = found[id];
-        if (count) subagentCounts.set(id, count);
-        else subagentCounts.delete(id);
-      }
-      for (const id of ids) {
-        const agent = agents.get(id);
-        if (agent) {
-          renderContextPill(agent);
-          renderSubagentPill(agent);
+      for (const batch of chunk(due, POLL_BATCH_SIZE)) {
+        if (lifetime.signal.aborted) break;
+        const [contextRes, subagentRes] = await Promise.all([
+          client.rpc(contextUsageRpc, { agentIds: batch }),
+          client.rpc(subagentCountsRpc, { agentIds: batch }).catch(() => null),
+        ]);
+        for (const id of batch) {
+          lastPolledAt.set(id, Date.now());
+          if (contextRes.native.includes(id)) nativeContext.add(id);
+          else nativeContext.delete(id);
+          contextStore.set(id, contextRes.usage[id] ?? null);
+          // Only overwrite subagent counts when the RPC succeeded, avoiding flicker on transient failures.
+          if (subagentRes) {
+            const found = subagentRes.counts[id];
+            if (found) subagentCounts.set(id, found);
+            else subagentCounts.delete(id);
+          }
+          const agent = agents.get(id);
+          if (agent) {
+            renderContextPill(agent);
+            renderSubagentPill(agent);
+          }
         }
       }
+      publishWorkspaceSubagents();
     } catch (error) {
       if (!lifetime.signal.aborted) console.warn("[antigravity-accounts] context refresh failed", error);
     } finally {
       polling = false;
     }
   }
+
   let soon: Timer | undefined;
-  function pollSoon() {
+  function pollSoon(forceAll = false) {
     clearTimeout(soon);
-    soon = setTimeout(() => void pollContext(), 800);
+    soon = setTimeout(() => void pollContext(forceAll), 800);
   }
   const contextTimer = setInterval(() => void pollContext(), CONTEXT_POLL_MS);
 
@@ -381,7 +492,16 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     if (lifetime.signal.aborted || (accounts && accounts.revision > next.revision)) return;
     accounts = next;
     agents.forEach(renderAccountPill);
+    // Refresh Orchestrator model lists whenever account membership, sign-in state, or overrides change.
+    const nextSignature = next.accounts
+      .map((a) => `${a.id}:${a.status}:${a.email ?? ""}:${JSON.stringify(a.orchestratorOverride)}`)
+      .join("|");
+    if (accountSignature && nextSignature !== accountSignature) {
+      void readOrchestrator(true);
+    }
+    accountSignature = nextSignature;
   }
+
   let retry: Timer | undefined;
   async function readAccounts() {
     try {
@@ -393,6 +513,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       retry = setTimeout(readAccounts, 5000);
     }
   }
+
   const watch = client.subscribe(
     watchAccountsSubscription,
     {},
@@ -408,13 +529,19 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
 
   // ---- Agents -------------------------------------------------------------------------------
 
-  function publishCounts() {
-    const next = new Map<string, number>();
-    for (const { account } of agents.values()) next.set(account, (next.get(account) ?? 0) + 1);
-    if (counts && counts.size === next.size && [...next].every(([id, n]) => counts?.get(id) === n)) return;
-    counts = next;
-    listeners.forEach((listener) => listener());
+  function publishAgents() {
+    const nextCounts = new Map<string, number>();
+    const nextMembers: ObservedAgent[] = [];
+    for (const member of agents.values()) {
+      nextMembers.push(member);
+      nextCounts.set(member.account, (nextCounts.get(member.account) ?? 0) + 1);
+    }
+    counts = nextCounts;
+    memberSnapshot = nextMembers;
+    publishWorkspaceSubagents();
+    emit();
   }
+
   function remove(id: string) {
     accountPills.get(id)?.remove();
     accountPills.delete(id);
@@ -425,27 +552,35 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     orchestratorPills.get(id)?.remove();
     orchestratorPills.delete(id);
     subagentCounts.delete(id);
+    lastPolledAt.delete(id);
+    nativeContext.delete(id);
     contextStore.delete(id);
     agents.delete(id);
   }
+
   function upsert(row: AgentRow) {
     if (row.archivedAt || !isAntigravityProvider(row.provider)) return remove(row.id);
-    const member: Member = {
+    const member: ObservedAgent = {
       id: row.id,
       workspace: row.workspaceId ?? null,
       account: accountIdFromMetadata(row.metadata),
       running: row.status === "running" || row.status === "initializing",
       model: row.model ?? null,
+      title: row.title ?? null,
     };
     const old = agents.get(row.id);
     // A status change usually means a turn started or ended: context changes then.
-    if (!old || old.running !== member.running) pollSoon();
+    if (!old || old.running !== member.running) {
+      lastPolledAt.delete(row.id);
+      pollSoon();
+    }
     if (
       old &&
       old.workspace === member.workspace &&
       old.account === member.account &&
       old.running === member.running &&
-      old.model === member.model
+      old.model === member.model &&
+      old.title === member.title
     ) {
       return;
     }
@@ -456,6 +591,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
     renderSubagentPill(member);
     renderOrchestratorPill(member);
   }
+
   let reconnect: Timer | undefined;
   async function observe() {
     try {
@@ -467,14 +603,14 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
           const ids = new Set(entries.map(({ agent }) => agent.id));
           for (const id of agents.keys()) if (!ids.has(id)) remove(id);
           entries.forEach(({ agent }) => upsert(agent));
-          publishCounts();
+          publishAgents();
         },
         update(message) {
           if (lifetime.signal.aborted || message.type !== "agent_update") return;
           const update = message.payload;
           if (update.kind === "remove") remove(update.agentId);
           else upsert(update.agent);
-          publishCounts();
+          publishAgents();
         },
       });
     } catch (error) {
@@ -485,9 +621,9 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
   }
   void observe();
 
-  // ---- /account -----------------------------------------------------------------------------
+  // ---- /account & /orchestrator -------------------------------------------------------------
 
-  const slash = client.addSlashCommand({
+  const slashAccount = client.addSlashCommand({
     name: "account",
     context: "agent",
     description: messages.message("slash"),
@@ -500,14 +636,15 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       const current = accountIdFromMetadata(agent.metadata);
       const input = args.trim().toLowerCase();
       if (!input) {
+        const curAccount = list.find((account) => account.id === current);
         return notify(
           client.i18n.t(messages, "choices", {
-            label: nameOf(list.find((account) => account.id === current)?.label ?? current),
-            list: list.map((account, index) => `${index + 1}. ${nameOf(account.label)}`).join("\n"),
+            label: curAccount ? nameOf(curAccount.label, curAccount.kind) : current,
+            list: list.map((account, index) => `${index + 1}. ${nameOf(account.label, account.kind)}`).join("\n"),
           }),
         );
       }
-      const named = (account: AccountSummary) => nameOf(account.label).toLowerCase();
+      const named = (account: AccountSummary) => nameOf(account.label, account.kind).toLowerCase();
       let matches = list.filter((account) => named(account) === input || account.label.toLowerCase() === input);
       if (/^\d+$/.test(input)) matches = list.slice(Number(input) - 1, Number(input));
       else if (!matches.length) matches = list.filter((account) => named(account).startsWith(input));
@@ -516,20 +653,103 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       if (!target.usable || target.status === "signed-out") {
         return notify(target.statusDetail || client.i18n.t(messages, "unusable"));
       }
-      await switchTo(agent.id, target, agent.status === "running" ? "after-turn" : "now");
+      const busy = agent.status === "running" || agent.status === "initializing";
+      await switchTo(agent.id, target, busy ? "after-turn" : "now");
+    },
+  });
+
+  const slashOrchestrator = client.addSlashCommand({
+    name: "orchestrator",
+    context: "agent",
+    description: messages.message("orchestrator.slash"),
+    argumentHint: messages.message("orchestrator.slashHint"),
+    async onSubmit({ agent, args }) {
+      if (!isAntigravityProvider(agent.provider)) return notify(client.i18n.t(messages, "only"));
+      const state = await client.rpc(getOrchestratorRpc, {});
+      orchestrator = state;
+      const member = agents.get(agent.id) ?? {
+        id: agent.id,
+        workspace: agent.workspaceId ?? null,
+        account: accountIdFromMetadata(agent.metadata),
+        running: agent.status === "running" || agent.status === "initializing",
+        model: agent.model ?? null,
+        title: agent.title ?? null,
+      };
+      const input = args.trim();
+      if (!input) {
+        const eff = effectiveOrchestrator(member, state);
+        return notify(
+          client.i18n.t(messages, "orchestrator.slashCurrent", {
+            planner: eff.savedPlanner ?? client.i18n.t(messages, "orchestrator.default"),
+            executor: eff.savedExecutor ?? client.i18n.t(messages, "orchestrator.default"),
+          }),
+        );
+      }
+      const lower = input.toLowerCase();
+      const presets = resolvePresets(state);
+      const preset = presets.find((p) => p.id === lower);
+      if (preset) {
+        await chooseOrchestrator(member, { planner: preset.planner, executor: preset.executor });
+        return;
+      }
+      const [first, ...rest] = input.split(/\s+/);
+      const role = first?.toLowerCase() === "planner" || first?.toLowerCase() === "executor" ? (first.toLowerCase() as "planner" | "executor") : null;
+      const query = (role ? rest.join(" ") : input).trim().toLowerCase();
+      const findVariant = (families: readonly ModelFamily[]) => {
+        if (query === "default" || query === "reset") return null;
+        for (const family of families) {
+          for (const variant of family.variants) {
+            if (
+              variant.label.toLowerCase() === query ||
+              variant.id.toLowerCase() === query ||
+              shortModelLabel(variant.label).toLowerCase() === query
+            ) {
+              return variant.label;
+            }
+          }
+        }
+        for (const family of families) {
+          for (const variant of family.variants) {
+            if (variant.label.toLowerCase().includes(query) || variant.id.toLowerCase().includes(query)) {
+              return variant.label;
+            }
+          }
+        }
+        return undefined;
+      };
+      if (role) {
+        const picked = findVariant(role === "planner" ? state.planners : state.executors);
+        if (picked === undefined) return notify(client.i18n.t(messages, "orchestrator.slashNoMatch"));
+        await chooseOrchestrator(member, { [role]: picked });
+        return;
+      }
+      const asPlanner = findVariant(state.planners);
+      if (asPlanner !== undefined) {
+        await chooseOrchestrator(member, { planner: asPlanner });
+        return;
+      }
+      const asExecutor = findVariant(state.executors);
+      if (asExecutor !== undefined) {
+        await chooseOrchestrator(member, { executor: asExecutor });
+        return;
+      }
+      notify(client.i18n.t(messages, "orchestrator.slashNoMatch"));
     },
   });
 
   return {
     useNotifications,
+    notify,
     counts: () => counts,
+    members: () => memberSnapshot,
+    workspaceRunningSubagents: () => workspaceSubagents,
     subscribe(listener: () => void) {
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
       };
     },
-    refreshContext: () => pollContext(),
+    refreshContext: () => pollContext(true),
     /** Settings changed elsewhere (the console screen): redraw the Orchestrator pills. */
     setOrchestrator(state: OrchestratorState) {
       orchestrator = state;
@@ -542,7 +762,8 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       clearTimeout(soon);
       clearInterval(contextTimer);
       clearInterval(orchestratorTimer);
-      slash();
+      slashAccount();
+      slashOrchestrator();
       accountPills.forEach((pill) => pill.remove());
       contextPills.forEach((pill) => pill.remove());
       subagentPills.forEach((pill) => pill.remove());
@@ -552,6 +773,7 @@ export function observeAgents(client: PluginClientContext, openSubagents: OpenSu
       subagentPills.clear();
       orchestratorPills.clear();
       subagentCounts.clear();
+      lastPolledAt.clear();
       agents.clear();
       listeners.clear();
       presenters.clear();

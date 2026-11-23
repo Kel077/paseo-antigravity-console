@@ -1,4 +1,3 @@
-import type { PaseoApi } from "./types";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   ACCOUNT_METADATA_KEY,
@@ -9,11 +8,13 @@ import {
 } from "../shared/contracts";
 import type { AccountService } from "./accounts";
 import { sessionEnv } from "./agy";
-import { ensureProfile } from "./profile";
+import { conversationIdFrom } from "./context";
+import type { PaseoApi } from "./types";
 
-/** Agents that switch account once their running turn ends: agent id → target account id. */
+/** Agents that switch account once their running turn ends, plus in-flight manual switches. */
 export class PendingSwitches {
   private readonly pending = new Map<string, string>();
+  private readonly manualSwitching = new Set<string>();
 
   set(agentId: string, accountId: string): void {
     this.pending.set(agentId, accountId);
@@ -28,12 +29,26 @@ export class PendingSwitches {
   delete(agentId: string): void {
     this.pending.delete(agentId);
   }
+
+  beginManual(agentId: string): void {
+    this.manualSwitching.add(agentId);
+  }
+
+  endManual(agentId: string): void {
+    this.manualSwitching.delete(agentId);
+  }
+
+  isManual(agentId: string): boolean {
+    return this.manualSwitching.has(agentId);
+  }
 }
 
 export interface SwitchInput {
   agentId: string;
   accountId: string;
   when: "now" | "after-turn";
+  /** True when the user explicitly chose the account (bypasses automatic open redirect). */
+  manual?: boolean;
 }
 
 export interface SwitchOutcome {
@@ -79,6 +94,7 @@ export async function switchAgentAccount(
     return { result: "scheduled", accountLabel };
   }
   pending.delete(input.agentId);
+  if (input.manual) pending.beginManual(input.agentId);
   try {
     await handle.reload();
   } catch (error) {
@@ -93,14 +109,98 @@ export async function switchAgentAccount(
       `"${accountLabel}" could not open this agent: ${reason}` +
         (restored ? ` The agent stays on "${service.labelOf(current)}".` : ""),
     );
+  } finally {
+    if (input.manual) pending.endManual(input.agentId);
   }
   return { result: "switched", accountLabel };
 }
 
+export interface MigrateInput {
+  fromAccountId: string;
+  toAccountId: string;
+  mode: "idle-only" | "after-turn" | "now";
+}
+
+export interface MigrateOutcome {
+  switched: number;
+  scheduled: number;
+  skipped: number;
+  failed: Array<{ agentId: string; title: string | null; error: string }>;
+  targetLabel: string;
+}
+
+/** Moves all matching Antigravity agents from one account onto another. */
+export async function migrateAccountAgents(
+  paseo: PaseoApi,
+  service: AccountService,
+  pending: PendingSwitches,
+  input: MigrateInput,
+): Promise<MigrateOutcome> {
+  if (input.fromAccountId === input.toAccountId) {
+    throw new Error("Choose a different target account.");
+  }
+  service.requireAccount(input.fromAccountId);
+  const target = service.requireAccount(input.toAccountId);
+  if (target?.unsafeDetail) throw new Error(target.unsafeDetail);
+  const targetLabel = service.labelOf(input.toAccountId);
+  if (target) {
+    const status = await service.quotaFor(input.toAccountId, 5 * 60_000);
+    if (status.status === "signed-out") {
+      throw new Error(`Sign in to "${targetLabel}" before migrating agents to it.`);
+    }
+  }
+  const { entries } = await paseo.agents.list();
+  let switched = 0;
+  let scheduled = 0;
+  let skipped = 0;
+  const failed: MigrateOutcome["failed"] = [];
+
+  for (const { agent } of entries) {
+    if (agent.archivedAt || !isAntigravityProvider(agent.provider)) continue;
+    if (accountIdFromMetadata(agent.metadata) !== input.fromAccountId) continue;
+    const running = agent.status === "running" || agent.status === "initializing";
+    if (running && input.mode === "idle-only") {
+      skipped += 1;
+      continue;
+    }
+    try {
+      const outcome = await switchAgentAccount(paseo, service, pending, {
+        agentId: agent.id,
+        accountId: input.toAccountId,
+        when: input.mode === "now" ? "now" : "after-turn",
+        manual: true,
+      });
+      if (outcome.result === "switched") switched += 1;
+      else if (outcome.result === "scheduled") scheduled += 1;
+      else skipped += 1;
+    } catch (error) {
+      failed.push({
+        agentId: agent.id,
+        title: agent.title ?? null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return { switched, scheduled, skipped, failed, targetLabel };
+}
+
 /** The fallback controller's part of the session-open path; kept as an interface to avoid an import cycle. */
 export interface OpenFallback {
-  healthOf(accountId: string): Promise<FallbackEvent["reason"] | null>;
-  redirectForOpen(paseo: PaseoApi, agentId: string, accountId: string, reason: FallbackEvent["reason"], record: boolean): Promise<string | null>;
+  healthOf(accountId: string, model?: string | null): Promise<FallbackEvent["reason"] | null>;
+  redirectForOpen(
+    paseo: PaseoApi,
+    agentId: string,
+    accountId: string,
+    reason: FallbackEvent["reason"],
+    record: boolean,
+    model?: string | null,
+  ): Promise<string | null>;
+  pickNext(current: string, tried: ReadonlySet<string>, model?: string | null): Promise<string | null>;
+}
+
+export interface HookObservers {
+  onConversationAccount?: (conversationId: string, accountId: string) => void;
+  onAgentArchived?: (agentId: string) => void;
 }
 
 export function registerHooks(
@@ -108,28 +208,40 @@ export function registerHooks(
   service: AccountService,
   pending: PendingSwitches,
   fallback?: OpenFallback,
+  observers?: HookObservers,
 ): Array<() => void> {
   const removers: Array<() => void> = [];
 
-  // New Antigravity agents get the default account unless the composer chose one.
+  // New Antigravity agents get the default account (or best fallback when configured & default is unavailable).
   removers.push(
     server.addHook("agent.create.before", async ({ request }) => {
       if (!isAntigravityProvider(request.config.provider)) return undefined;
+      await service.init();
       const metadata = request.metadata ?? {};
       if (typeof metadata[ACCOUNT_METADATA_KEY] === "string") return undefined;
       const state = await service.state();
-      if (state.defaultAccountId === SYSTEM_ACCOUNT_ID) return undefined;
-      const account = service.store.get(state.defaultAccountId);
+      const model = request.config.model ?? null;
+      let chosen = state.defaultAccountId;
+      const fallbackSettings = service.fallbackSettings();
+      if (fallbackSettings.enabled && fallback) {
+        const problem = await fallback.healthOf(chosen, model);
+        if (problem) {
+          const better = await fallback.pickNext(chosen, new Set([chosen]), model);
+          if (better) chosen = better;
+        }
+      }
+      if (chosen === SYSTEM_ACCOUNT_ID) return undefined;
+      const account = service.store.get(chosen);
       if (!account || account.unsafeDetail || service.knownStatus(account.id) === "signed-out") {
         // A default that cannot run would make every new agent fail; leave it on the system sign-in.
         console.warn(
-          `antigravity-accounts: default account ${state.defaultAccountId} cannot run; new agent stays on the system sign-in`,
+          `antigravity-accounts: default account ${chosen} cannot run; new agent stays on the system sign-in`,
         );
         return undefined;
       }
       return {
         ...request,
-        metadata: { ...metadata, [ACCOUNT_METADATA_KEY]: state.defaultAccountId },
+        metadata: { ...metadata, [ACCOUNT_METADATA_KEY]: chosen },
       };
     }),
   );
@@ -140,11 +252,24 @@ export function registerHooks(
       if (!isAntigravityProvider(request.provider)) return undefined;
       await service.init();
       let accountId = accountIdFromMetadata(request.metadata);
-      // Fallback: an account known to be unable to serve gives way to the next one that can.
-      if (service.fallbackSettings().enabled && fallback) {
-        const reason = await fallback.healthOf(accountId);
+      // Fallback: an account known to be unable to serve gives way to the next one that can,
+      // unless the user explicitly asked to switch this agent to that account right now.
+      if (service.fallbackSettings().enabled && fallback && !pending.isManual(request.agentId)) {
+        const snapshot = await paseo.agents
+          .ref(request.agentId)
+          .refresh()
+          .catch(() => null);
+        const model = snapshot?.agent.model ?? null;
+        const reason = await fallback.healthOf(accountId, model);
         if (reason) {
-          const next = await fallback.redirectForOpen(paseo, request.agentId, accountId, reason, request.purpose === "interactive");
+          const next = await fallback.redirectForOpen(
+            paseo,
+            request.agentId,
+            accountId,
+            reason,
+            request.purpose === "interactive",
+            model,
+          );
           if (next) accountId = next;
         }
       }
@@ -163,7 +288,7 @@ export function registerHooks(
           }
         }
       }
-      if (accountId !== SYSTEM_ACCOUNT_ID) await ensureProfile(accountId);
+      if (accountId !== SYSTEM_ACCOUNT_ID) await service.ensureAccountProfile(accountId);
       return {
         ...request,
         env: { ...request.env, ...sessionEnv(accountId, request.env) },
@@ -171,12 +296,23 @@ export function registerHooks(
     }),
   );
 
-  // A finished turn used quota: re-read that account's quota shortly after, once per burst.
+  // A finished turn used quota: re-read that account's quota shortly after and record attribution.
   const quotaRefresh = new Map<string, NodeJS.Timeout>();
   removers.push(
-    server.addHook("agent.turn.after", async ({ agent }) => {
+    server.addHook("agent.turn.after", async ({ agent }, { paseo }) => {
       if (!isAntigravityProvider(agent.provider)) return;
+      await service.init();
       const accountId = accountIdFromMetadata(agent.metadata);
+      if (observers?.onConversationAccount) {
+        void paseo.agents
+          .ref(agent.id)
+          .refresh()
+          .then((snapshot) => {
+            const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+            if (conversationId) observers.onConversationAccount?.(conversationId, accountId);
+          })
+          .catch(() => undefined);
+      }
       clearTimeout(quotaRefresh.get(accountId));
       quotaRefresh.set(
         accountId,
@@ -199,10 +335,13 @@ export function registerHooks(
       if (!target) return;
       if (accountIdFromMetadata(agent.metadata) !== target) return;
       await new Promise((resolve) => setTimeout(resolve, 500));
+      pending.beginManual(agent.id);
       try {
         await paseo.agents.ref(agent.id).reload();
       } catch (error) {
         console.error(`antigravity-accounts: deferred switch of ${agent.id} failed`, error);
+      } finally {
+        pending.endManual(agent.id);
       }
     }),
   );
@@ -210,6 +349,7 @@ export function registerHooks(
   removers.push(
     server.addHook("agent.archive.after", async ({ agent }) => {
       pending.delete(agent.id);
+      observers?.onAgentArchived?.(agent.id);
     }),
   );
 

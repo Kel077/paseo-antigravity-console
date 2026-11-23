@@ -5,11 +5,14 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, Text, View } from "react-native";
 import { cancelSignInRpc, startSignInRpc, submitSignInRpc, type AccountSummary, type AccountsState } from "../shared/contracts";
 import { relative } from "./format";
+import { displayLabel } from "./labels";
 import { errorMessage, messages } from "./messages";
 import { font, mono, radius, space, tint, type Colors } from "./theme";
 import { Button, Callout, Muted } from "./ui";
 
 type Session = RpcOutput<typeof startSignInRpc>;
+
+const RETRYABLE_INPUT_PREFIX = "Invalid input: ";
 
 function Step({
   colors,
@@ -68,6 +71,7 @@ export function SignIn({
   const toast = useToast();
   const { t, locale } = useTranslation(messages);
   const [session, setSession] = useState<Session | null>(null);
+  const [sessionAlive, setSessionAlive] = useState(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -76,6 +80,7 @@ export function SignIn({
   const [now, setNow] = useState(Date.now);
   const active = useRef(true);
   const login = useRef<string | null>(null);
+  const accountName = displayLabel(account.label, t, account.kind);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 15_000);
@@ -87,12 +92,14 @@ export function SignIn({
     active.current = true;
     setError("");
     setSession(null);
+    setSessionAlive(false);
     setOpened(false);
     void start({ accountId: account.id })
       .then((result) => {
         if (disposed) return cancel({ loginId: result.loginId }).then(() => undefined);
         login.current = result.loginId;
         setSession(result);
+        setSessionAlive(true);
         return undefined;
       })
       .catch((reason: unknown) => {
@@ -110,22 +117,35 @@ export function SignIn({
   const expired = session ? Date.parse(session.expiresAt) <= now : false;
 
   async function finish() {
-    if (!login.current || busy || !code.trim()) return;
+    if (!login.current || busy) return;
+    const trimmed = code.trim();
+    if (!trimmed) return;
+    if (/[\r\n]/.test(trimmed)) {
+      setError(t("signin.singleLine"));
+      return;
+    }
     setBusy(true);
     setError("");
     try {
-      const state = await submit({ loginId: login.current, code: code.trim() });
+      const state = await submit({ loginId: login.current, code: trimmed });
       login.current = null;
+      setSessionAlive(false);
       accept(state);
       if (active.current) {
-        toast.show(t("signin.done", { label: account.label }), { variant: "success" });
+        toast.show(t("signin.done", { label: accountName }), { variant: "success" });
         close();
       }
     } catch (reason) {
       if (active.current) {
-        setError(errorMessage(reason));
-        // agy exits after a rejected code; the next try needs a fresh link.
-        login.current = null;
+        const raw = errorMessage(reason);
+        // Validation errors never send anything to agy, so the sign-in process is still waiting.
+        const retryable = raw.includes(RETRYABLE_INPUT_PREFIX);
+        setError(retryable ? raw.replace(RETRYABLE_INPUT_PREFIX, "") : raw);
+        if (!retryable) {
+          // agy exits after a rejected code; the next try needs a fresh link.
+          login.current = null;
+          setSessionAlive(false);
+        }
       }
     } finally {
       if (active.current) setBusy(false);
@@ -138,7 +158,7 @@ export function SignIn({
   }
 
   return (
-    <Modal open title={t("signin.title", { label: account.label })} onOpenChange={(open) => { if (!open && !busy) close(); }}>
+    <Modal open title={t("signin.title", { label: accountName })} onOpenChange={(open) => { if (!open && !busy) close(); }}>
       <Modal.Content>
         {!session && !error ? (
           <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.lg }}>
@@ -183,7 +203,7 @@ export function SignIn({
                 autoCorrect={false}
                 spellCheck={false}
                 maxLength={16384}
-                editable={!busy && !expired}
+                editable={!busy && !expired && sessionAlive}
                 value={code}
                 onChangeText={setCode}
                 onSubmitEditing={() => void finish()}
@@ -214,10 +234,10 @@ export function SignIn({
 
         <View style={{ flexDirection: "row", justifyContent: "flex-end", flexWrap: "wrap", gap: space.sm, marginTop: space.sm }}>
           <Button colors={colors} variant="ghost" label={t("dialog.cancel")} disabled={busy} onPress={close} />
-          {error || expired ? (
+          {!sessionAlive || error || expired ? (
             <Button colors={colors} variant="secondary" icon="RotateCcw" label={t("signin.restart")} disabled={busy} onPress={restart} />
           ) : null}
-          {session && !expired && login.current ? (
+          {session && !expired && sessionAlive ? (
             <Button
               colors={colors}
               variant="primary"

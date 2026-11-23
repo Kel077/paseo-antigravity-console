@@ -50,7 +50,7 @@ function normalizeState(state: string): string {
   return value;
 }
 
-/** Ids and roles a `kill` call names. */
+/** Ids and roles a `kill` or `kill_all` call names. */
 function killedStates(input: unknown, output: unknown): SubagentCheck["states"] {
   const record = (input && typeof input === "object" ? input : {}) as { ConversationIds?: unknown };
   const ids = Array.isArray(record.ConversationIds)
@@ -58,7 +58,9 @@ function killedStates(input: unknown, output: unknown): SubagentCheck["states"] 
     : [];
   const roles =
     typeof output === "string" ? (/Killed roles:\s*([^\n]+)/.exec(output)?.[1] ?? "").split(/,\s*/).filter(Boolean) : [];
-  const count = Math.max(ids.length, roles.length);
+  const reportedCount =
+    typeof output === "string" ? Number(/killed\s+(\d+)\s+subagent/i.exec(output)?.[1] ?? 0) : 0;
+  const count = Math.max(ids.length, roles.length, Number.isFinite(reportedCount) ? reportedCount : 0);
   return Array.from({ length: count }, (_, index) => ({
     id: ids[index] ?? `#${index + 1}`,
     role: roles[index] ?? null,
@@ -94,7 +96,9 @@ export function registerSubagentTransforms(client: PluginClientContext) {
         const action = typeof input?.Action === "string" ? input.Action : "";
         if (!action) return undefined;
         const states =
-          action === "kill" ? killedStates(item.detail.input, item.detail.output) : listedStates(item.detail.output);
+          action === "kill" || action === "kill_all"
+            ? killedStates(item.detail.input, item.detail.output)
+            : listedStates(item.detail.output);
         const data: SubagentCheck = { action, states, status };
         return { items: [{ type: "plugin", kind: SUBAGENT_LIST_TIMELINE_KIND, version: 1, data }] };
       }

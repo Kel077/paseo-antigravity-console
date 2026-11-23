@@ -1,18 +1,18 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { PaseoApi } from "./types";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   SYSTEM_ACCOUNT_ID,
   isAntigravityProvider,
   type ModelFamily,
+  type OrchestratorChoice,
   type OrchestratorState,
 } from "../shared/contracts";
 import type { AccountService } from "./accounts";
-import { commandEnv, runAgy } from "./agy";
-import { ensureProfile } from "./profile";
-import { REAL_CLI_DIR, REAL_SETTINGS_FILE, paseoHome, resolveAgy } from "./paths";
+import { NEEDS_SIGN_IN, commandEnv, runAgy } from "./agy";
+import { REAL_CLI_DIR, REAL_SETTINGS_FILE, paseoHome, profileHome, resolveAgy } from "./paths";
+import type { PaseoApi } from "./types";
 
 /**
  * agy 1.5.14 runs its Orchestrator models as a planner that hands the plan to an executor. Which
@@ -141,42 +141,70 @@ function familiesFor(
 
 export class OrchestratorSettings {
   private readonly catalogs = new Map<string, Catalog>();
+  private readonly fetching = new Map<string, Promise<CatalogModel[] | null>>();
   private readonly failures = new Map<string, number>();
   private readonly pendingReloads = new Set<string>();
   private readonly timers = new Set<NodeJS.Timeout>();
   private writing: Promise<unknown> = Promise.resolve();
+  private writeSeq = 0;
 
   constructor(private readonly service: AccountService) {}
 
-  private async catalog(accountId: string, identity: string, refresh: boolean): Promise<CatalogModel[] | null> {
+  invalidateAccount(accountId: string): void {
+    this.catalogs.delete(accountId);
+    this.failures.delete(accountId);
+  }
+
+  /**
+   * Whether `accountId` is known to support `model`. Returns `null` when the account's model
+   * catalog has not been fetched yet so callers do not falsely block an unchecked account.
+   */
+  supportsModel(accountId: string, model: string | null | undefined): boolean | null {
+    if (!model) return null;
+    const cached = this.catalogs.get(accountId);
+    if (!cached) return null;
+    const normalized = model.trim().toLowerCase().replace(/^antigravity\//, "");
+    return cached.models.some((entry) => entry.id.toLowerCase() === normalized || entry.label.toLowerCase() === normalized);
+  }
+
+  private catalog(accountId: string, identity: string, refresh: boolean): Promise<CatalogModel[] | null> {
     const cached = this.catalogs.get(accountId);
     const usable = cached && cached.identity === identity ? cached : undefined;
-    if (usable && !refresh && Date.now() - usable.fetchedAt < CATALOG_TTL_MS) return usable.models;
-    if (!refresh && Date.now() - (this.failures.get(accountId) ?? 0) < FAILURE_BACKOFF_MS) return usable?.models ?? null;
-    const agy = await resolveAgy();
-    if (!agy) throw new Error("Antigravity CLI (agy) was not found.");
-    if (accountId !== SYSTEM_ACCOUNT_ID) await ensureProfile(accountId);
-    const result = await runAgy(agy, ["models"], {
-      env: commandEnv(accountId),
-      cwd: os.homedir(),
-      timeoutMs: 30_000,
-      stopWhen: /Authentication required/i,
-    });
-    const models = result.code === 0 && !result.timedOut && !result.stopped ? parseCatalog(result.stdout) : [];
-    if (!models.length) {
-      this.failures.set(accountId, Date.now());
-      return usable?.models ?? null;
+    if (usable && !refresh && Date.now() - usable.fetchedAt < CATALOG_TTL_MS) return Promise.resolve(usable.models);
+    if (!refresh && Date.now() - (this.failures.get(accountId) ?? 0) < FAILURE_BACKOFF_MS) {
+      return Promise.resolve(usable?.models ?? null);
     }
-    this.failures.delete(accountId);
-    this.catalogs.set(accountId, { models, fetchedAt: Date.now(), identity });
-    return models;
+    const inflight = this.fetching.get(accountId);
+    if (inflight) return inflight;
+    const task = (async () => {
+      const agy = await resolveAgy();
+      if (!agy) throw new Error("Antigravity CLI (agy) was not found.");
+      if (accountId !== SYSTEM_ACCOUNT_ID) await this.service.ensureAccountProfile(accountId);
+      const result = await runAgy(agy, ["models"], {
+        env: commandEnv(accountId),
+        cwd: accountId === SYSTEM_ACCOUNT_ID ? os.tmpdir() : profileHome(accountId),
+        timeoutMs: 30_000,
+        stopWhen: NEEDS_SIGN_IN,
+      });
+      const models = result.code === 0 && !result.timedOut && !result.stopped ? parseCatalog(result.stdout) : [];
+      if (!models.length) {
+        this.failures.set(accountId, Date.now());
+        return usable?.models ?? null;
+      }
+      this.failures.delete(accountId);
+      this.catalogs.set(accountId, { models, fetchedAt: Date.now(), identity });
+      return models;
+    })().finally(() => {
+      if (this.fetching.get(accountId) === task) this.fetching.delete(accountId);
+    });
+    this.fetching.set(accountId, task);
+    return task;
   }
 
   async state(refresh = false): Promise<OrchestratorState> {
     await this.service.init();
-    const accounts = (await this.service.state()).accounts.filter(
-      (account) => account.usable && account.status !== "signed-out",
-    );
+    const accountState = await this.service.state();
+    const accounts = accountState.accounts.filter((account) => account.usable && account.status !== "signed-out");
     const catalogs = new Map<string, CatalogModel[]>();
     let error: string | null = null;
     await Promise.all(
@@ -189,7 +217,7 @@ export class OrchestratorSettings {
         }
       }),
     );
-    // Keep the system sign-in first, then the list order.
+    // Keep configured account order, with the system sign-in first when present.
     const ordered = new Map(
       [...catalogs].sort(
         ([a], [b]) =>
@@ -205,17 +233,32 @@ export class OrchestratorSettings {
       error = failure instanceof Error ? failure.message : String(failure);
     }
     if (!ordered.size && !error) error = "No signed-in account could list its models.";
+    const overrides: Record<string, OrchestratorChoice> = {};
+    for (const account of accountState.accounts) {
+      if (account.kind === "profile" && account.orchestratorOverride) {
+        overrides[account.id] = account.orchestratorOverride;
+      }
+    }
     return {
       planner: savedRole(settings, "planner"),
       executor: savedRole(settings, "executor"),
+      overrides,
       planners: familiesFor(PLANNER_FAMILIES, ordered, curated),
       executors: familiesFor(EXECUTOR_FAMILIES, ordered, curated),
       error,
     };
   }
 
-  /** Saves the planner and executor the way agy's own `/model` does. `null` restores agy's default. */
-  async save(update: { planner?: string | null; executor?: string | null }): Promise<OrchestratorState> {
+  /**
+   * Saves the planner and executor either globally (agy's settings.json) or as a per-account
+   * override for a profile account. `null` restores agy's default.
+   */
+  async save(update: {
+    planner?: string | null;
+    executor?: string | null;
+    accountId?: string;
+    inheritGlobal?: boolean;
+  }): Promise<OrchestratorState> {
     const state = await this.state();
     const known = (families: readonly ModelFamily[], label: string) =>
       families.some((family) => family.variants.some((variant) => variant.label === label));
@@ -225,6 +268,20 @@ export class OrchestratorSettings {
     if (update.executor && !known(state.executors, update.executor)) {
       throw new Error(`${update.executor} is not an executor model your accounts can use.`);
     }
+    if (update.accountId && update.accountId !== SYSTEM_ACCOUNT_ID) {
+      if (update.inheritGlobal) {
+        await this.service.setAccountOptions(update.accountId, { orchestratorOverride: null });
+        return this.state();
+      }
+      const existing = state.overrides[update.accountId] ?? { planner: state.planner, executor: state.executor };
+      const next: OrchestratorChoice = {
+        planner: update.planner !== undefined ? update.planner : existing.planner,
+        executor: update.executor !== undefined ? update.executor : existing.executor,
+      };
+      await this.service.setAccountOptions(update.accountId, { orchestratorOverride: next });
+      return this.state();
+    }
+
     const run = this.writing.then(async () => {
       const settings = await readSettingsJson();
       const orchestrator: Record<string, unknown> = { ...orchestratorOf(settings) };
@@ -237,12 +294,13 @@ export class OrchestratorSettings {
       if (Object.keys(orchestrator).length) settings.orchestrator = orchestrator;
       else delete settings.orchestrator;
       await fs.mkdir(REAL_CLI_DIR, { recursive: true });
-      const temp = `${SETTINGS_FILE}.paseo-${process.pid}-${Date.now()}.tmp`;
+      const temp = `${SETTINGS_FILE}.paseo-${process.pid}-${Date.now()}-${++this.writeSeq}.tmp`;
       await fs.writeFile(temp, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
       await fs.rename(temp, SETTINGS_FILE);
     });
     this.writing = run.catch(() => undefined);
     await run;
+    await this.service.syncAllProfiles();
     return this.state();
   }
 
@@ -277,6 +335,9 @@ export class OrchestratorSettings {
 
   register(server: PluginServerContext): Array<() => void> {
     return [
+      this.service.onStatusUpdated(({ accountId, signedInChanged }) => {
+        if (signedInChanged) this.invalidateAccount(accountId);
+      }),
       server.addHook("agent.turn.after", async ({ agent }, { paseo }) => {
         if (!this.pendingReloads.has(agent.id)) return;
         const timer = setTimeout(() => {

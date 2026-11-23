@@ -1,6 +1,25 @@
+import type { AccountSummary } from "../shared/contracts";
+
 /** The server's default name for the system sign-in; shown translated until the user renames it. */
 export const DEFAULT_SYSTEM_LABEL = "System sign-in";
 
-export function displayLabel(label: string, translate: (key: "systemName") => string): string {
+export function displayLabel(
+  label: string,
+  translate: (key: "systemName") => string,
+  kind?: AccountSummary["kind"],
+): string {
+  if (kind === "profile") return label;
   return label === DEFAULT_SYSTEM_LABEL ? translate("systemName") : label;
+}
+
+/** Formats a list of names using locale-appropriate punctuation (e.g. `, ` in English, `、` in Chinese). */
+export function joinList(items: readonly string[], locale: string): string {
+  if (items.length <= 1) return items[0] ?? "";
+  try {
+    const ListFormat = (Intl as { ListFormat?: new (locale: string, options: { style: string; type: string }) => { format(list: readonly string[]): string } }).ListFormat;
+    if (ListFormat) return new ListFormat(locale, { style: "narrow", type: "conjunction" }).format(items);
+  } catch {
+    // Fallback below.
+  }
+  return items.join(locale.toLowerCase().startsWith("zh") ? "、" : ", ");
 }

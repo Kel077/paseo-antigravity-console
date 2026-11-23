@@ -21,6 +21,8 @@ export function FallbackNote({ item, theme }: PluginTimelineItemProps<FallbackEv
         : t("fallback.exhausted");
   const icon = event.event === "switch" ? "ArrowLeftRight" : event.event === "retry" ? "RotateCcw" : "CircleAlert";
   const tone = event.event === "exhausted" ? colors.statusWarning : colors.foregroundMuted;
+  const detail = event.message.trim();
+  const showDetail = detail.length > 0 && (event.event !== "switch" || event.reason !== "quota");
   return (
     <View
       style={{
@@ -38,9 +40,9 @@ export function FallbackNote({ item, theme }: PluginTimelineItemProps<FallbackEv
       </View>
       <View style={{ flex: 1, gap: 2 }}>
         <Text style={{ ...font.small, color: colors.foreground }}>{text}</Text>
-        {event.event !== "switch" || event.reason !== "quota" ? (
+        {showDetail ? (
           <Text numberOfLines={2} selectable style={{ ...font.caption, color: colors.foregroundMuted }}>
-            {event.message}
+            {detail}
           </Text>
         ) : null}
       </View>

@@ -10,21 +10,28 @@ function DraftAccount({ composer }: { composer: PluginComposer }) {
   const { t } = useTranslation(messages);
   if (!data) return null;
   const selected = composer.agent.metadata[ACCOUNT_METADATA_KEY];
-  const options = data.accounts
-    .filter((account) => account.usable)
-    .map((account) => ({
+  const activeValue = typeof selected === "string" ? selected : data.defaultAccountId;
+  // Offer usable accounts that are not known to be signed out (keep the currently selected one visible if already picked).
+  const selectable = data.accounts.filter(
+    (account) => account.usable && (account.status !== "signed-out" || account.id === activeValue),
+  );
+  const candidates = selectable.length > 0 ? selectable : data.accounts.filter((account) => account.usable);
+  const options = candidates.map((account) => {
+    const email = account.kind === "profile" && account.status === "signed-out" ? null : account.email;
+    return {
       value: account.id,
-      label: displayLabel(account.label, t),
+      label: displayLabel(account.label, t, account.kind),
       description: t("composerDescription", {
-        detail: account.email ?? t(`kind.${account.kind}`),
+        detail: [email ?? t(`kind.${account.kind}`), account.plan].filter(Boolean).join(" · "),
         status: t(`status.${account.status}`),
       }),
-    }));
+    };
+  });
   return (
     <Select
       title={t("account")}
       icon="UserRound"
-      value={typeof selected === "string" ? selected : data.defaultAccountId}
+      value={activeValue}
       options={options}
       // An explicit "default" keeps the system sign-in even when another account is the default.
       onValueChange={({ value }) => composer.setMetadata({ [ACCOUNT_METADATA_KEY]: value })}

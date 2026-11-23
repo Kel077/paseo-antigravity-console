@@ -24,6 +24,27 @@ export function integer(value: number, locale: string): string {
   return new Intl.NumberFormat(locale).format(value);
 }
 
+/** "$0.00", "$0.0042", "$1.28", "$124.50", "$1,234" — readable USD cost formatting. */
+export function usd(value: number, locale = "en-US"): string {
+  if (!Number.isFinite(value) || value <= 0) return "$0.00";
+  if (value < 0.0001) return "<$0.0001";
+  if (value < 0.01) return `$${value.toFixed(4)}`;
+  if (value < 1) return `$${value.toFixed(3)}`;
+  if (value >= 1000) {
+    return `$${new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(Math.round(value))}`;
+  }
+  return `$${new Intl.NumberFormat(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value)}`;
+}
+
+/** Compact USD formatter for chart Y-axis ticks. */
+export function usdShort(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "$0";
+  if (value < 0.01) return `$${trim(value, 4)}`;
+  if (value < 1) return `$${trim(value, 3)}`;
+  if (value < 100) return `$${trim(value, 2)}`;
+  return `$${Math.round(value)}`;
+}
+
 /** "in 3 hours" / "5 minutes ago" in the app language. */
 export function relative(timestamp: string | number, now: number, locale: string): string {
   const time = typeof timestamp === "number" ? timestamp : Date.parse(timestamp);

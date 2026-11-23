@@ -1,24 +1,28 @@
 import { useRpc, useTranslation, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SettingsCard, SettingsRow, SettingsSelect, SettingsSwitch, useToast } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { ActivityIndicator, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import {
+  clearCooldownRpc,
   createAccountRpc,
+  moveAccountRpc,
   refreshAccountsRpc,
   removeAccountRpc,
   renameAccountRpc,
+  setAccountOptionsRpc,
   setDefaultAccountRpc,
   setFallbackRpc,
   signOutAccountRpc,
   type AccountSummary,
+  type FallbackStrategy,
 } from "../shared/contracts";
 import { AccountCard, type CardAction } from "./AccountCard";
 import type { AgentObservation } from "./agents";
-import { ConfirmRemove, NameDialog } from "./dialogs";
+import { AccountAgentsDialog, ConfirmRemove, NameDialog, RecoverFilesDialog } from "./dialogs";
 import { displayLabel } from "./labels";
 import { antigravityLogo } from "./logo";
 import { errorMessage, messages } from "./messages";
-import { OrchestratorRows } from "./orchestrator";
+import { AccountOrchestratorDialog, OrchestratorRows } from "./orchestrator";
 import { SignIn } from "./signIn";
 import { UsageSection } from "./stats";
 import { font, radius, space, tint, type Colors } from "./theme";
@@ -29,7 +33,10 @@ type Dialog =
   | { kind: "add" }
   | { kind: "rename"; account: AccountSummary }
   | { kind: "remove"; account: AccountSummary }
-  | { kind: "signIn"; account: AccountSummary };
+  | { kind: "signIn"; account: AccountSummary }
+  | { kind: "recoverFiles"; account: AccountSummary }
+  | { kind: "manageAgents"; account: AccountSummary }
+  | { kind: "orchestratorOverride"; account: AccountSummary };
 
 function SectionTitle({ colors, title, count }: { colors: Colors; title: string; count?: number }) {
   return (
@@ -75,20 +82,25 @@ function AddAccountCard({ colors, onAdd }: { colors: Colors; onAdd(): void }) {
   );
 }
 
-export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProps & { observation: AgentObservation }) {
+export function AccountsScreen({ theme, layout, navigation, host, observation }: PluginSurfaceProps & { observation: AgentObservation }) {
   const { colors } = theme;
   const { t } = useTranslation(messages);
   const toast = useToast();
   const { data, error, accept, refetch } = useAccounts();
   const counts = useSyncExternalStore(observation.subscribe, observation.counts);
+  const members = useSyncExternalStore(observation.subscribe, observation.members);
   const create = useRpc(createAccountRpc);
   const refresh = useRpc(refreshAccountsRpc);
   const rename = useRpc(renameAccountRpc);
+  const move = useRpc(moveAccountRpc);
+  const setOptions = useRpc(setAccountOptionsRpc);
+  const clearCooldown = useRpc(clearCooldownRpc);
   const remove = useRpc(removeAccountRpc);
   const setDefault = useRpc(setDefaultAccountRpc);
   const setFallback = useRpc(setFallbackRpc);
   const signOut = useRpc(signOutAccountRpc);
   const [dialog, setDialog] = useState<Dialog | null>(null);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [busy, setBusy] = useState<Record<string, CardAction | null>>({});
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [now, setNow] = useState(Date.now);
@@ -111,6 +123,7 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
   }
 
   function onAction(account: AccountSummary, action: CardAction) {
+    setOpenMenuId(null);
     const input = { accountId: account.id };
     switch (action) {
       case "refresh":
@@ -120,6 +133,23 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
       case "makeDefault":
         return void track(account.id, action, async () => {
           accept(await setDefault(input));
+        });
+      case "moveUp":
+        return void track(account.id, action, async () => {
+          accept(await move({ accountId: account.id, direction: "up" }));
+        });
+      case "moveDown":
+        return void track(account.id, action, async () => {
+          accept(await move({ accountId: account.id, direction: "down" }));
+        });
+      case "toggleFallback":
+        return void track(account.id, action, async () => {
+          accept(await setOptions({ accountId: account.id, fallbackEnabled: !account.fallbackEnabled }));
+        });
+      case "clearCooldown":
+        return void track(account.id, action, async () => {
+          accept(await clearCooldown(input));
+          toast.show(t("cooldownCleared", { label: displayLabel(account.label, t, account.kind) }), { variant: "success" });
         });
       case "signOut":
         return void track(account.id, action, async () => {
@@ -131,6 +161,12 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
         return setDialog({ kind: "remove", account });
       case "signIn":
         return setDialog({ kind: "signIn", account });
+      case "recoverFiles":
+        return setDialog({ kind: "recoverFiles", account });
+      case "manageAgents":
+        return setDialog({ kind: "manageAgents", account });
+      case "orchestratorOverride":
+        return setDialog({ kind: "orchestratorOverride", account });
     }
   }
 
@@ -150,6 +186,14 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
   return (
     <View style={{ flex: 1, backgroundColor: colors.surface0 }} onLayout={(event) => setWidth(event.nativeEvent.layout.width)}>
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding, alignItems: "center" }}>
+        {openMenuId ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={t("dialog.close")}
+            onPress={() => setOpenMenuId(null)}
+            style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, zIndex: 15 }}
+          />
+        ) : null}
         <View style={{ width: contentWidth || "100%", maxWidth: 980, gap: space.xxxl }}>
           <View style={{ flexDirection: "row", alignItems: "center", gap: space.lg }}>
             <Avatar colors={colors} label="A" logo={antigravityLogo} size={compact ? 40 : 48} />
@@ -164,6 +208,7 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
               accessibilityLabel={t("refreshAll")}
               loading={refreshingAll}
               onPress={() => {
+                setOpenMenuId(null);
                 setRefreshingAll(true);
                 void refresh({})
                   .then(accept)
@@ -171,7 +216,17 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
                   .finally(() => setRefreshingAll(false));
               }}
             />
-            <Button colors={colors} variant="primary" icon="Plus" label={compact ? "" : t("add")} accessibilityLabel={t("add")} onPress={() => setDialog({ kind: "add" })} />
+            <Button
+              colors={colors}
+              variant="primary"
+              icon="Plus"
+              label={compact ? "" : t("add")}
+              accessibilityLabel={t("add")}
+              onPress={() => {
+                setOpenMenuId(null);
+                setDialog({ kind: "add" });
+              }}
+            />
           </View>
 
           {error ? (
@@ -193,7 +248,9 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
             </Callout>
           ) : null}
 
-          {contentWidth > 0 ? <UsageSection colors={colors} width={contentWidth} compact={compact} /> : null}
+          {contentWidth > 0 ? (
+            <UsageSection colors={colors} width={contentWidth} compact={compact} accounts={data?.accounts ?? []} />
+          ) : null}
 
           {!data && !error ? (
             <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.xl, alignSelf: "center" }}>
@@ -203,22 +260,36 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
           ) : null}
 
           {data ? (
-            <View style={{ gap: space.md }}>
+            <View style={{ gap: space.md, zIndex: openMenuId ? 20 : 0 }}>
               <SectionTitle colors={colors} title={t("accountsHeading")} count={data.accounts.length} />
               <View style={{ flexDirection: "row", flexWrap: "wrap", gap }}>
-                {data.accounts.map((account, index) => (
-                  <View key={account.id} style={{ width: cardWidth || "100%", alignSelf: "stretch", zIndex: data.accounts.length - index }}>
-                    <AccountCard
-                      account={account}
-                      colors={colors}
-                      count={counts ? (counts.get(account.id) ?? 0) : undefined}
-                      now={now}
-                      busy={busy[account.id] ?? null}
-                      compact={compact}
-                      onAction={(action) => onAction(account, action)}
-                    />
-                  </View>
-                ))}
+                {data.accounts.map((account, index) => {
+                  const isOpen = openMenuId === account.id;
+                  return (
+                    <View
+                      key={account.id}
+                      style={{
+                        width: cardWidth || "100%",
+                        alignSelf: "stretch",
+                        zIndex: isOpen ? 100 : data.accounts.length - index,
+                      }}
+                    >
+                      <AccountCard
+                        account={account}
+                        colors={colors}
+                        count={counts ? (counts.get(account.id) ?? 0) : undefined}
+                        now={now}
+                        busy={busy[account.id] ?? null}
+                        compact={compact}
+                        canMoveUp={index > 0}
+                        canMoveDown={index < data.accounts.length - 1}
+                        menuOpen={isOpen}
+                        onToggleMenu={() => setOpenMenuId((current) => (current === account.id ? null : account.id))}
+                        onAction={(action) => onAction(account, action)}
+                      />
+                    </View>
+                  );
+                })}
                 {showAddTile ? (
                   <View style={{ width: cardWidth || "100%", alignSelf: "stretch" }}>
                     <AddAccountCard colors={colors} onAdd={() => setDialog({ kind: "add" })} />
@@ -235,7 +306,9 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
                 <SettingsSelect
                   label={t("overview.default")}
                   value={data.defaultAccountId}
-                  options={data.accounts.filter((account) => account.usable).map((account) => ({ value: account.id, label: displayLabel(account.label, t) }))}
+                  options={data.accounts
+                    .filter((account) => account.usable)
+                    .map((account) => ({ value: account.id, label: displayLabel(account.label, t, account.kind) }))}
                   onValueChange={(accountId) => {
                     void setDefault({ accountId })
                       .then(accept)
@@ -265,7 +338,22 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
                       .catch((reason: unknown) => toast.error(errorMessage(reason)));
                   }}
                 />
-                <OrchestratorRows accounts={data.accounts} onChange={(state) => observation.setOrchestrator(state)} />
+                <SettingsSelect
+                  label={t("settings.strategy")}
+                  disabled={!data.fallback.enabled}
+                  value={data.fallback.strategy}
+                  options={[
+                    { value: "order", label: t("settings.strategyOrder") },
+                    { value: "quota", label: t("settings.strategyQuota") },
+                    { value: "reset", label: t("settings.strategyReset") },
+                  ]}
+                  onValueChange={(value) => {
+                    void setFallback({ strategy: value as FallbackStrategy })
+                      .then(accept)
+                      .catch((reason: unknown) => toast.error(errorMessage(reason)));
+                  }}
+                />
+                <OrchestratorRows colors={colors} accounts={data.accounts} onChange={(state) => observation.setOrchestrator(state)} />
                 <SettingsRow label={t("overview.cli")} hint={data.agyPath ?? undefined}>
                   <Text style={{ ...font.small, color: data.agyPath ? colors.foreground : colors.statusWarning }}>
                     {data.agyPath ? t("overview.cliValue", { version: data.agyVersion ?? "?" }) : t("overview.cliMissing")}
@@ -273,7 +361,12 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
                 </SettingsRow>
               </SettingsCard>
               {defaultUnavailable && fallback ? (
-                <Callout colors={colors} tone="warning" icon="TriangleAlert" title={t("overview.defaultUnavailable", { label: displayLabel(fallback.label, t) })} />
+                <Callout
+                  colors={colors}
+                  tone="warning"
+                  icon="TriangleAlert"
+                  title={t("overview.defaultUnavailable", { label: displayLabel(fallback.label, t, fallback.kind) })}
+                />
               ) : null}
             </View>
           ) : null}
@@ -298,7 +391,7 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
         <NameDialog
           colors={colors}
           title={t("dialog.renameTitle")}
-          initial={displayLabel(dialog.account.label, t)}
+          initial={displayLabel(dialog.account.label, t, dialog.account.kind)}
           confirmLabel={t("dialog.save")}
           onClose={() => setDialog(null)}
           onSubmit={async (label) => {
@@ -311,7 +404,7 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
         <ConfirmRemove
           colors={colors}
           accountId={dialog.account.id}
-          label={displayLabel(dialog.account.label, t)}
+          label={displayLabel(dialog.account.label, t, dialog.account.kind)}
           onClose={() => setDialog(null)}
           onConfirm={async () => {
             const { state, moved } = await remove({ accountId: dialog.account.id });
@@ -328,6 +421,34 @@ export function AccountsScreen({ theme, layout, observation }: PluginSurfaceProp
       ) : null}
       {dialog?.kind === "signIn" ? (
         <SignIn key={dialog.account.id} account={dialog.account} colors={colors} accept={accept} close={() => setDialog(null)} />
+      ) : null}
+      {dialog?.kind === "recoverFiles" ? (
+        <RecoverFilesDialog colors={colors} account={dialog.account} onClose={() => setDialog(null)} />
+      ) : null}
+      {dialog?.kind === "manageAgents" && data ? (
+        <AccountAgentsDialog
+          colors={colors}
+          account={dialog.account}
+          accounts={data.accounts}
+          agents={members.filter((member) => member.account === dialog.account.id)}
+          onOpenAgent={
+            navigation?.openAgent
+              ? (agentId) => navigation.openAgent({ agentId, serverId: host.id })
+              : undefined
+          }
+          onClose={() => setDialog(null)}
+        />
+      ) : null}
+      {dialog?.kind === "orchestratorOverride" ? (
+        <AccountOrchestratorDialog
+          colors={colors}
+          account={dialog.account}
+          onSaved={(state) => {
+            observation.setOrchestrator(state);
+            void refetch();
+          }}
+          onClose={() => setDialog(null)}
+        />
       ) : null}
     </View>
   );

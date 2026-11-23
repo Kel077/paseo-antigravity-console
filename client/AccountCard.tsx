@@ -1,16 +1,28 @@
 import { useTranslation } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
-import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import type { AccountSummary, QuotaBucket, QuotaGroup } from "../shared/contracts";
 import { percent, relative } from "./format";
 import { displayLabel } from "./labels";
+import { antigravityLogo } from "./logo";
 import { messages } from "./messages";
 import { font, radius, remainingTone, space, tabular, tint, toneColor, type Colors, type Tone } from "./theme";
-import { antigravityLogo } from "./logo";
 import { Avatar, Badge, Bar, Button, Callout, Card, Divider, hueFor, IconButton, Muted } from "./ui";
 
-export type CardAction = "refresh" | "rename" | "makeDefault" | "signIn" | "signOut" | "remove";
+export type CardAction =
+  | "refresh"
+  | "rename"
+  | "makeDefault"
+  | "moveUp"
+  | "moveDown"
+  | "toggleFallback"
+  | "clearCooldown"
+  | "orchestratorOverride"
+  | "recoverFiles"
+  | "manageAgents"
+  | "signIn"
+  | "signOut"
+  | "remove";
 
 function statusTone(account: AccountSummary): Tone {
   if (!account.usable) return "warning";
@@ -83,7 +95,19 @@ function Meter({
   );
 }
 
-function QuotaGroupView({ colors, group, now, locale, compact }: { colors: Colors; group: QuotaGroup; now: number; locale: string; compact: boolean }) {
+function QuotaGroupView({
+  colors,
+  group,
+  now,
+  locale,
+  compact,
+}: {
+  colors: Colors;
+  group: QuotaGroup;
+  now: number;
+  locale: string;
+  compact: boolean;
+}) {
   const { t: translate } = useTranslation(messages);
   const t = (key: KnownWindow) => translate(`window.${key}`);
   // Two meters per row: the usual pair is weekly and 5-hour.
@@ -119,7 +143,7 @@ function Menu({
     <Card
       colors={colors}
       elevated
-      style={{ position: "absolute", top: 44, right: space.md, minWidth: 200, padding: space.xs, zIndex: 20, backgroundColor: colors.surface0 }}
+      style={{ position: "absolute", top: 44, right: space.md, minWidth: 220, padding: space.xs, zIndex: 20, backgroundColor: colors.surface0 }}
     >
       {items.map((item) => (
         <Pressable
@@ -152,6 +176,10 @@ export function AccountCard({
   now,
   busy,
   compact,
+  canMoveUp,
+  canMoveDown,
+  menuOpen,
+  onToggleMenu,
   onAction,
 }: {
   account: AccountSummary;
@@ -160,16 +188,20 @@ export function AccountCard({
   now: number;
   busy: CardAction | null;
   compact: boolean;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+  menuOpen: boolean;
+  onToggleMenu(): void;
   onAction(action: CardAction): void;
 }) {
   const { t, locale } = useTranslation(messages);
-  const [menuOpen, setMenuOpen] = useState(false);
   const isProfile = account.kind === "profile";
   const signedIn = account.status === "signed-in";
   const tone = statusTone(account);
   const statusLabel = account.usable ? t(`status.${account.status}`) : t("callout.unusableTitle");
-  const name = displayLabel(account.label, t);
+  const name = displayLabel(account.label, t, account.kind);
   const justChecked = account.checkedAt !== null && now - Date.parse(account.checkedAt) < 45_000;
+  const activeCooldowns = account.cooldowns.filter((item) => Date.parse(item.until) > now);
 
   const menuItems: Array<{ id: CardAction; label: string; icon: string; danger?: boolean }> = [
     { id: "rename", label: t("action.rename"), icon: "PenLine" },
@@ -177,19 +209,29 @@ export function AccountCard({
   if (!account.isDefaultForNewAgents && account.usable) {
     menuItems.push({ id: "makeDefault", label: t("action.makeDefault"), icon: "Star" });
   }
+  if (canMoveUp) menuItems.push({ id: "moveUp", label: t("action.moveUp"), icon: "ArrowUp" });
+  if (canMoveDown) menuItems.push({ id: "moveDown", label: t("action.moveDown"), icon: "ArrowDown" });
+  menuItems.push({
+    id: "toggleFallback",
+    label: account.fallbackEnabled ? t("action.disableFallback") : t("action.enableFallback"),
+    icon: account.fallbackEnabled ? "ShieldOff" : "ShieldCheck",
+  });
+  if (activeCooldowns.length > 0) {
+    menuItems.push({ id: "clearCooldown", label: t("action.clearCooldown"), icon: "Play" });
+  }
+  if (count !== undefined && count > 0) {
+    menuItems.push({ id: "manageAgents", label: t("action.manageAgents"), icon: "Bot" });
+  }
   if (isProfile) {
+    menuItems.push({ id: "orchestratorOverride", label: t("action.orchestratorOverride"), icon: "Workflow" });
+    menuItems.push({ id: "recoverFiles", label: t("action.recoverFiles"), icon: "FolderInput" });
     if (signedIn) menuItems.push({ id: "signIn", label: t("action.signInAgain"), icon: "LogIn" });
     if (account.status !== "signed-out") menuItems.push({ id: "signOut", label: t("action.signOut"), icon: "LogOut" });
     menuItems.push({ id: "remove", label: t("action.remove"), icon: "Trash2", danger: true });
   }
 
-  const select = (action: CardAction) => {
-    setMenuOpen(false);
-    onAction(action);
-  };
-
   return (
-    <Card colors={colors} style={{ flex: 1, zIndex: menuOpen ? 10 : 0, overflow: "visible" }}>
+    <Card colors={colors} style={{ flex: 1, zIndex: menuOpen ? 30 : 0, overflow: "visible" }}>
       <View style={{ flex: 1, padding: space.lg, gap: space.md }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.md }}>
           <Avatar colors={colors} label={name} logo={isProfile ? undefined : antigravityLogo} hue={isProfile ? hueFor(account.id) : undefined} />
@@ -206,14 +248,57 @@ export function AccountCard({
               {(isProfile && account.status === "signed-out" ? null : account.email) ?? t(`kind.${account.kind}`)}
             </Text>
           </View>
-          <IconButton colors={colors} icon="Ellipsis" label={t("action.more")} active={menuOpen} onPress={() => setMenuOpen((open) => !open)} />
+          <IconButton colors={colors} icon="Ellipsis" label={t("action.more")} active={menuOpen} onPress={onToggleMenu} />
         </View>
 
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.xs + 2 }}>
           <Badge colors={colors} label={statusLabel} tone={tone} dot />
+          {account.plan ? <Badge colors={colors} label={account.plan} icon="Sparkles" /> : null}
           <Badge colors={colors} label={t(`kind.${account.kind}`)} icon={isProfile ? "UserRound" : "KeyRound"} />
-          {count !== undefined ? <Badge colors={colors} label={t("agents", { count })} icon="Bot" /> : null}
+          {!account.fallbackEnabled ? <Badge colors={colors} label={t("badgeNoFallback")} icon="ShieldOff" /> : null}
+          {account.orchestratorOverride ? (
+            <Pressable accessibilityRole="button" onPress={() => onAction("orchestratorOverride")}>
+              <Badge colors={colors} label={t("badgeCustomOrchestrator")} tone="accent" icon="Workflow" />
+            </Pressable>
+          ) : null}
+          {count !== undefined ? (
+            <Pressable
+              accessibilityRole="button"
+              disabled={count === 0}
+              onPress={() => onAction("manageAgents")}
+            >
+              <Badge colors={colors} label={t("agents", { count })} tone={count > 0 ? "accent" : "neutral"} icon="Bot" />
+            </Pressable>
+          ) : null}
         </View>
+
+        {activeCooldowns.length > 0 ? (
+          <Callout
+            colors={colors}
+            tone="warning"
+            icon="Clock"
+            title={activeCooldowns
+              .map((entry) =>
+                t("badgeCooldown", {
+                  pool: t(`cooldownPool.${entry.pool}`),
+                  time: relative(entry.until, now, locale),
+                }),
+              )
+              .join(" · ")}
+            action={
+              <Button
+                colors={colors}
+                size="sm"
+                variant="secondary"
+                icon="Play"
+                label={t("clearCooldown")}
+                loading={busy === "clearCooldown"}
+                disabled={busy !== null}
+                onPress={() => onAction("clearCooldown")}
+              />
+            }
+          />
+        ) : null}
 
         {!account.usable ? (
           <Callout colors={colors} tone="warning" icon="ShieldAlert" title={t("callout.unusableTitle")}>
@@ -275,7 +360,7 @@ export function AccountCard({
           />
         </View>
       </View>
-      {menuOpen ? <Menu colors={colors} items={menuItems} onSelect={select} /> : null}
+      {menuOpen ? <Menu colors={colors} items={menuItems} onSelect={onAction} /> : null}
     </Card>
   );
 }

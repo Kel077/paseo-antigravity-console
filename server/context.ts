@@ -13,12 +13,18 @@ import { decode, int as number, message } from "./protobuf";
  */
 
 const CONVERSATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_DB_CACHE = 250;
 
 interface GenerationUsage {
   input: number;
   output: number;
   cached: number;
   window: number | null;
+}
+
+interface CachedDbUsage {
+  signature: string;
+  usage: ContextUsage | null;
 }
 
 function parseGeneration(data: Uint8Array): GenerationUsage | null {
@@ -46,11 +52,22 @@ function loadSqlite(): Promise<SqliteModule | null> {
 
 /** Guesses the window when agy did not record it. Gemini models in Antigravity use 1M tokens. */
 function windowForModel(model: string | null): number | null {
-  const name = (model ?? "").toLowerCase();
+  const name = (model ?? "").toLowerCase().replace(/^antigravity\//, "");
   if (name.startsWith("gemini") || name.includes("orchestrator")) return 1_048_576;
   if (name.startsWith("claude")) return 200_000;
   if (name.startsWith("gpt-oss")) return 131_072;
   return null;
+}
+
+const dbCache = new Map<string, CachedDbUsage>();
+
+function rememberDb(key: string, entry: CachedDbUsage) {
+  dbCache.delete(key);
+  dbCache.set(key, entry);
+  if (dbCache.size > MAX_DB_CACHE) {
+    const oldest = dbCache.keys().next().value;
+    if (oldest) dbCache.delete(oldest);
+  }
 }
 
 export async function readConversationUsage(
@@ -61,8 +78,18 @@ export async function readConversationUsage(
   const conversations = path.join(REAL_CLI_DIR, SHARED_CLI_DIRS[0]);
   const file = path.join(conversations, `${conversationId}.db`);
   const stat = await fs.stat(file).catch(() => null);
-  if (!stat?.isFile()) return null;
+  if (!stat?.isFile()) {
+    dbCache.delete(conversationId);
+    return null;
+  }
   const walStat = await fs.stat(`${file}-wal`).catch(() => null);
+  const signature = `${stat.mtimeMs}:${stat.size}:${walStat?.mtimeMs ?? 0}:${walStat?.size ?? 0}:${model ?? ""}`;
+  const cached = dbCache.get(conversationId);
+  if (cached && cached.signature === signature) {
+    // Refresh LRU order.
+    rememberDb(conversationId, cached);
+    return cached.usage;
+  }
   const module = await loadSqlite();
   if (!module) return null;
   let db: InstanceType<SqliteModule["DatabaseSync"]> | null = null;
@@ -83,10 +110,13 @@ export async function readConversationUsage(
       window ??= parsed.window;
       if (latest && window) break;
     }
-    if (!latest) return null;
+    if (!latest) {
+      rememberDb(conversationId, { signature, usage: null });
+      return null;
+    }
     const guessed = windowForModel(model);
     const size = window ?? guessed;
-    return {
+    const usage: ContextUsage = {
       used: latest.input + latest.cached + latest.output,
       size,
       input: latest.input,
@@ -97,9 +127,11 @@ export async function readConversationUsage(
       updatedAt: new Date(Math.max(stat.mtimeMs, walStat?.mtimeMs ?? 0)).toISOString(),
       model,
     };
+    rememberDb(conversationId, { signature, usage });
+    return usage;
   } catch (error) {
     console.error(`antigravity-accounts: could not read context usage of ${conversationId}`, error);
-    return null;
+    return cached?.usage ?? null;
   } finally {
     try {
       db?.close();
@@ -121,7 +153,7 @@ interface AgentInfo {
 
 const UUID_IN_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-function conversationIdFrom(persistence: unknown): string | null {
+export function conversationIdFrom(persistence: unknown): string | null {
   if (!persistence) return null;
   const text = JSON.stringify(persistence);
   const named = /"conversationId"\s*:\s*"([0-9a-f-]{36})"/i.exec(text)?.[1];
@@ -176,7 +208,11 @@ export class ContextReader {
           usage[agentId] = null;
           return;
         }
-        if (info.native) native.push(agentId);
+        if (info.native) {
+          native.push(agentId);
+          usage[agentId] = null;
+          return;
+        }
         usage[agentId] = info.conversationId
           ? await readConversationUsage(info.conversationId, info.model)
           : null;
@@ -189,13 +225,15 @@ export class ContextReader {
   async conversationOf(
     paseo: PaseoApi,
     agentId: string,
-  ): Promise<{ conversationId: string | null; closed: boolean } | null> {
+  ): Promise<{ conversationId: string | null; closed: boolean; model: string | null } | null> {
     const info = await this.info(paseo, agentId);
     if (!info?.antigravity) return null;
-    return { conversationId: info.conversationId, closed: info.closed };
+    return { conversationId: info.conversationId, closed: info.closed, model: info.model };
   }
 
   forget(agentId: string): void {
+    const cached = this.agents.get(agentId);
+    if (cached?.conversationId) dbCache.delete(cached.conversationId);
     this.agents.delete(agentId);
   }
 }

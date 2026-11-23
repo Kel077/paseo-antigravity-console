@@ -6,28 +6,35 @@ import {
   type PluginClientContext,
   type PluginTimelineItemProps,
 } from "@getpaseo/plugin/client";
-import { Icon, Markdown, ScrollView, copyText, useToast } from "@getpaseo/plugin/client/ui";
+import { Icon, Markdown, ScrollView, TextInput, copyText, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Pressable, Text, View, type ScrollView as NativeScrollView } from "react-native";
 import {
   isAntigravityProvider,
   listSubagentsRpc,
+  subagentArtifactRpc,
   subagentDetailRpc,
+  type SubagentArtifactInfo,
   type SubagentCard,
   type SubagentCheck,
   type SubagentState,
   type SubagentSummary,
   type TranscriptEntry,
 } from "../shared/contracts";
-import { tokens } from "./format";
-import { messages } from "./messages";
+import { estimateRequestCost, resolveEffectiveRates, resolvePricingKey, type ModelRates } from "../shared/pricing";
+import { tokens, usd } from "./format";
+import { errorMessage, messages } from "./messages";
+import { usePricing } from "./pricing";
 import { font, mono, radius, space, tabular, tint, toneColor, type Colors, type Tone } from "./theme";
 import { Badge } from "./ui";
 
 export const SUBAGENT_PANEL_ID = "subagents";
 
 type ShownState = SubagentState | "starting";
+type ListFilter = "all" | "running" | "failed";
+type ActivityFilter = "all" | "tools" | "errors";
+
 function useMessages() {
   return useTranslation(messages);
 }
@@ -98,6 +105,12 @@ function clock(at: string | null, locale: string): string {
   return new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(time);
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
 function shownState(summary: SubagentSummary | undefined, status: SubagentCard["status"]): ShownState {
   if (summary) return summary.state;
   if (status === "failed") return "failed";
@@ -117,12 +130,41 @@ function StateLabel({ colors, state, t }: { colors: Colors; state: ShownState; t
   );
 }
 
-/** "86 steps · 9m · 50K out" */
-function metaLine(summary: SubagentSummary, t: Translate, locale: string): string {
+function estimateSubagentCost(summary: SubagentSummary, overrides: Readonly<Record<string, ModelRates>>): number | null {
+  if (!summary.model) return null;
+  const total = summary.inputTokens + summary.cachedTokens + summary.outputTokens;
+  if (total <= 0) return null;
+  const key = resolvePricingKey(summary.model, summary.model);
+  const at = summary.startedAt ? Date.parse(summary.startedAt) : Date.now();
+  const rates = resolveEffectiveRates(key, Number.isFinite(at) ? at : Date.now(), overrides);
+  if (!rates) return null;
+  // Estimate using base rates across accumulated subagent tokens.
+  const baseRates: ModelRates = { input: rates.input, cached: rates.cached, output: rates.output };
+  return estimateRequestCost(
+    { input: summary.inputTokens, cached: summary.cachedTokens, output: summary.outputTokens },
+    baseRates,
+  );
+}
+
+/** "86 steps · 9m · 50K out · ~$0.18" */
+function metaLine(
+  summary: SubagentSummary,
+  t: Translate,
+  locale: string,
+  overrides: Readonly<Record<string, ModelRates>> = {},
+): string {
   const parts = [t("subagents.steps", { count: summary.steps })];
-  const took = since(summary.startedAt, summary.reportedAt ?? summary.updatedAt, locale);
+  const end =
+    summary.reportedAt && summary.updatedAt
+      ? Date.parse(summary.reportedAt) >= Date.parse(summary.updatedAt)
+        ? summary.reportedAt
+        : summary.updatedAt
+      : (summary.reportedAt ?? summary.updatedAt);
+  const took = since(summary.startedAt, end, locale);
   if (took) parts.push(took);
   if (summary.outputTokens) parts.push(t("subagents.output", { value: tokens(summary.outputTokens) }));
+  const cost = estimateSubagentCost(summary, overrides);
+  if (cost !== null) parts.push(`~${usd(cost, locale)}`);
   return parts.join(" · ");
 }
 
@@ -132,11 +174,78 @@ function activityLine(summary: SubagentSummary | undefined, t: Translate): strin
   return summary.activity;
 }
 
+function transcriptToMarkdown(summary: SubagentSummary, entries: readonly TranscriptEntry[], report: string | null): string {
+  const lines: string[] = [
+    `# ${summary.role ?? summary.type ?? summary.id}`,
+    "",
+    `- **ID**: \`${summary.id}\``,
+    `- **State**: ${summary.state}`,
+    summary.model ? `- **Model**: ${summary.model}` : "",
+    `- **Tokens**: ${summary.inputTokens} input / ${summary.cachedTokens} cached / ${summary.outputTokens} output`,
+    "",
+  ].filter(Boolean);
+  if (report) {
+    lines.push("## Report", "", report, "");
+  }
+  lines.push("## Transcript", "");
+  for (const entry of entries) {
+    const stamp = entry.at ? `[${entry.at}] ` : "";
+    lines.push(`### ${stamp}Step ${entry.index} (${entry.kind})`);
+    if (entry.text) lines.push("", entry.text);
+    for (const tool of entry.tools) {
+      lines.push(`- \`${tool.name}\` ${tool.summary}${tool.failed ? " (FAILED)" : ""}`);
+      if (tool.output) lines.push("```", tool.output, "```");
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+function FilterChip({
+  colors,
+  label,
+  active,
+  onPress,
+}: {
+  colors: Colors;
+  label: string;
+  active: boolean;
+  onPress(): void;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ selected: active }}
+      onPress={onPress}
+      style={{
+        paddingHorizontal: space.sm,
+        height: 24,
+        borderRadius: radius.pill,
+        justifyContent: "center",
+        backgroundColor: active ? tint(colors.accent, 0.16) : tint(colors.foreground, 0.06),
+      }}
+    >
+      <Text style={{ ...font.caption, fontWeight: "500", color: active ? colors.accent : colors.foregroundMuted }}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
 export function createSubagentViews(client: PluginClientContext) {
   function open(agentId: string, workspaceId: string | null | undefined, subagentId?: string) {
     if (!workspaceId) return;
     if (subagentId) requested.set(agentId, subagentId);
     client.openPanel(SUBAGENT_PANEL_ID, { workspaceId, agentId });
+  }
+
+  function insertIntoComposer(agentId: string, text: string): boolean {
+    const composers = client.composers({ agentId });
+    const composer = composers[0];
+    if (!composer) return false;
+    composer.insertText(text);
+    void composer.focus().catch(() => undefined);
+    return true;
   }
 
   // ---- Timeline: the row of an `invoke_subagent` call ------------------------------------------
@@ -145,6 +254,8 @@ export function createSubagentViews(client: PluginClientContext) {
     const { colors } = theme;
     const { t, locale } = useTranslation(messages);
     const query = useSubagents(agentId);
+    const pricing = usePricing();
+    const overrides = pricing.data?.overrides ?? {};
     const workspaceId = useAgent(agentId, (agent) => agent.workspaceId);
     const card = item.data;
     const summary = query.data?.subagents.find((subagent) => subagent.id === card.id);
@@ -156,7 +267,7 @@ export function createSubagentViews(client: PluginClientContext) {
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`${title} · ${t(`subagents.state.${state}`)}`}
-        onPress={() => open(agentId, workspaceId, card.id)}
+        onPress={() => open(agentId, workspaceId, card.id || undefined)}
         style={(pressState) => ({
           flexDirection: "row",
           gap: space.md,
@@ -211,7 +322,7 @@ export function createSubagentViews(client: PluginClientContext) {
           ) : null}
           <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, marginTop: 2 }}>
             <Text numberOfLines={1} style={{ ...font.caption, ...tabular, color: colors.foregroundMuted, flex: 1 }}>
-              {summary ? metaLine(summary, t, locale) : ""}
+              {summary ? metaLine(summary, t, locale, overrides) : ""}
             </Text>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 2 }}>
               <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>{t("subagents.open")}</Text>
@@ -230,20 +341,30 @@ export function createSubagentViews(client: PluginClientContext) {
     const { t } = useTranslation(messages);
     const workspaceId = useAgent(agentId, (agent) => agent.workspaceId);
     const check = item.data;
-    const killed = check.action === "kill";
-    const title = killed
-      ? t("subagents.check.kill", { count: check.states.length })
-      : check.action === "list"
-        ? t("subagents.check.list")
-        : t("subagents.check.other", { action: check.action });
+    const killed = check.action === "kill" || check.action === "kill_all";
+    const title =
+      check.action === "kill_all"
+        ? check.states.length > 0
+          ? t("subagents.check.killAllCount", { count: check.states.length })
+          : t("subagents.check.killAll")
+        : check.action === "kill"
+          ? t("subagents.check.kill", { count: check.states.length })
+          : check.action === "list"
+            ? t("subagents.check.list")
+            : t("subagents.check.other", { action: check.action });
     const counts = new Map<string, number>();
     if (!killed) for (const entry of check.states) counts.set(entry.state, (counts.get(entry.state) ?? 0) + 1);
     const chips = [...counts].map(([state, count]) => {
       const known = (["running", "done", "stopped", "failed", "idle"] as const).find((value) => value === state);
       const label = known ? t(`subagents.state.${known}`) : state;
-      return { state: known ?? "idle", text: `${count} ${label}` };
+      return { raw: state, state: known ?? "idle", text: `${count} ${label}` };
     });
-    const names = killed ? check.states.map((entry) => entry.role ?? entry.id.slice(0, 8)).join(" · ") : "";
+    const names = killed
+      ? check.states
+          .map((entry) => entry.role ?? (entry.id.startsWith("#") ? "" : entry.id.slice(0, 8)))
+          .filter(Boolean)
+          .join(" · ")
+      : "";
     return (
       <Pressable
         accessibilityRole="button"
@@ -272,7 +393,7 @@ export function createSubagentViews(client: PluginClientContext) {
         ) : null}
         {chips.map((chip) => (
           <Text
-            key={chip.state}
+            key={chip.raw}
             numberOfLines={1}
             style={{ ...font.caption, ...tabular, color: toneColor(colors, STATE_TONE[chip.state as ShownState]) }}
           >
@@ -294,43 +415,116 @@ export function createSubagentViews(client: PluginClientContext) {
     const query = useSubagents(agentId, antigravity);
     const list = query.data?.subagents ?? [];
     const [selected, setSelected] = useState<string | null>(null);
+    const [filter, setFilter] = useState<ListFilter>("all");
+    const [search, setSearch] = useState("");
 
     useEffect(() => {
       const wanted = requested.get(agentId);
       if (wanted) {
         requested.delete(agentId);
         setSelected(wanted);
+      } else {
+        setSelected(null);
       }
+      setFilter("all");
+      setSearch("");
     }, [agentId, revision]);
 
-    const current = list.find((subagent) => subagent.id === selected) ?? (layout.compact ? undefined : list[0]);
+    const filtered = useMemo(() => {
+      const q = search.trim().toLowerCase();
+      return list.filter((subagent) => {
+        if (filter === "running" && subagent.state !== "running") return false;
+        if (filter === "failed" && subagent.state !== "failed") return false;
+        if (!q) return true;
+        return (
+          (subagent.role ?? "").toLowerCase().includes(q) ||
+          (subagent.type ?? "").toLowerCase().includes(q) ||
+          subagent.task.toLowerCase().includes(q)
+        );
+      });
+    }, [list, filter, search]);
+
+    const current =
+      filtered.find((subagent) => subagent.id === selected) ??
+      list.find((subagent) => subagent.id === selected) ??
+      (layout.compact ? undefined : filtered[0] ?? list[0]);
     const running = list.filter((subagent) => subagent.state === "running").length;
+    const failedCount = list.filter((subagent) => subagent.state === "failed").length;
 
     if (!antigravity) return <Empty colors={colors} icon="Bot" text={t("subagents.notAntigravity")} />;
     if (query.isLoading) return <Empty colors={colors} icon="LoaderCircle" text="" />;
     if (!list.length) return <Empty colors={colors} icon="Bot" text={t("subagents.empty")} />;
 
     const header = (
-      <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, paddingHorizontal: space.lg, paddingVertical: space.md }}>
-        <Text style={{ ...font.heading, color: colors.foreground }}>{t("subagents.title")}</Text>
-        <Text style={{ ...font.small, ...tabular, color: colors.foregroundMuted }}>
-          {running ? t("subagents.summary", { total: list.length, running }) : t("subagents.summaryIdle", { total: list.length })}
-        </Text>
+      <View style={{ gap: space.sm, paddingHorizontal: space.md, paddingTop: space.md, paddingBottom: space.sm }}>
+        <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, paddingHorizontal: space.xs }}>
+          <Text style={{ ...font.heading, color: colors.foreground }}>{t("subagents.title")}</Text>
+          <Text style={{ ...font.small, ...tabular, color: colors.foregroundMuted }}>
+            {running ? t("subagents.summary", { total: list.length, running }) : t("subagents.summaryIdle", { total: list.length })}
+          </Text>
+        </View>
+        {list.length > 1 ? (
+          <>
+            <View style={{ flexDirection: "row", gap: space.xs, flexWrap: "wrap" }}>
+              <FilterChip colors={colors} label={t("subagents.filter.all")} active={filter === "all"} onPress={() => setFilter("all")} />
+              {running > 0 ? (
+                <FilterChip
+                  colors={colors}
+                  label={`${t("subagents.filter.running")} (${running})`}
+                  active={filter === "running"}
+                  onPress={() => setFilter("running")}
+                />
+              ) : null}
+              {failedCount > 0 ? (
+                <FilterChip
+                  colors={colors}
+                  label={`${t("subagents.filter.failed")} (${failedCount})`}
+                  active={filter === "failed"}
+                  onPress={() => setFilter("failed")}
+                />
+              ) : null}
+            </View>
+            <TextInput
+              accessibilityLabel={t("subagents.searchPlaceholder")}
+              value={search}
+              onChangeText={setSearch}
+              placeholder={t("subagents.searchPlaceholder")}
+              placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
+              style={{
+                ...font.caption,
+                color: colors.foreground,
+                backgroundColor: colors.surface1,
+                borderWidth: 1,
+                borderColor: colors.border,
+                borderRadius: radius.md,
+                paddingHorizontal: space.sm + 2,
+                paddingVertical: space.xs + 2,
+              }}
+            />
+          </>
+        ) : null}
       </View>
     );
+
     const rows = (
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: space.sm, paddingBottom: space.lg, gap: 2 }}>
-        {list.map((subagent) => (
-          <ListRow
-            key={subagent.id}
-            colors={colors}
-            subagent={subagent}
-            parent={list.find((other) => other.id === subagent.parentId)}
-            active={!layout.compact && current?.id === subagent.id}
-            onPress={() => setSelected(subagent.id)}
-            t={t}
-          />
-        ))}
+        {filtered.length === 0 ? (
+          <View style={{ padding: space.lg, alignItems: "center" }}>
+            <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("subagents.noMatches")}</Text>
+          </View>
+        ) : (
+          filtered.map((subagent) => (
+            <ListRow
+              key={subagent.id}
+              colors={colors}
+              subagent={subagent}
+              parent={list.find((other) => other.id === subagent.parentId)}
+              active={!layout.compact && current?.id === subagent.id}
+              onPress={() => setSelected(subagent.id)}
+              t={t}
+            />
+          ))
+        )}
       </ScrollView>
     );
 
@@ -346,7 +540,14 @@ export function createSubagentViews(client: PluginClientContext) {
               <Icon name="ChevronLeft" size={16} color={colors.accent} />
               <Text style={{ ...font.small, color: colors.accent }}>{t("subagents.back")}</Text>
             </Pressable>
-            <Detail colors={colors} agentId={agentId} summary={current} compact />
+            <Detail
+              key={current.id}
+              colors={colors}
+              agentId={agentId}
+              summary={current}
+              compact
+              onInsertReport={(text) => insertIntoComposer(agentId, text)}
+            />
           </View>
         );
       }
@@ -366,7 +567,14 @@ export function createSubagentViews(client: PluginClientContext) {
         </View>
         <View style={{ flex: 1, minWidth: 0 }}>
           {current ? (
-            <Detail colors={colors} agentId={agentId} summary={current} compact={false} />
+            <Detail
+              key={current.id}
+              colors={colors}
+              agentId={agentId}
+              summary={current}
+              compact={false}
+              onInsertReport={(text) => insertIntoComposer(agentId, text)}
+            />
           ) : (
             <Empty colors={colors} icon="MousePointerClick" text={t("subagents.pick")} />
           )}
@@ -403,6 +611,8 @@ function ListRow({
   t: Translate;
 }) {
   const { locale } = useTranslation(messages);
+  const pricing = usePricing();
+  const overrides = pricing.data?.overrides ?? {};
   const color = toneColor(colors, STATE_TONE[subagent.state]);
   const activity = activityLine(subagent, t);
   return (
@@ -456,10 +666,67 @@ function ListRow({
           </Text>
         ) : null}
         <Text numberOfLines={1} style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
-          {metaLine(subagent, t, locale)}
+          {metaLine(subagent, t, locale, overrides)}
         </Text>
       </View>
     </Pressable>
+  );
+}
+
+function ArtifactPreview({
+  colors,
+  agentId,
+  subagentId,
+  artifact,
+  t,
+}: {
+  colors: Colors;
+  agentId: string;
+  subagentId: string;
+  artifact: SubagentArtifactInfo;
+  t: Translate;
+}) {
+  const readArtifact = useRpc(subagentArtifactRpc);
+  const query = useQuery({
+    queryKey: ["antigravity-accounts", "subagent-artifact", agentId, subagentId, artifact.path],
+    queryFn: () => readArtifact({ agentId, subagentId, path: artifact.path }),
+    staleTime: 10_000,
+  });
+
+  if (query.isLoading) {
+    return <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("subagents.artifactLoading")}</Text>;
+  }
+  if (query.error) {
+    return <Text style={{ ...font.caption, color: colors.statusDanger }}>{errorMessage(query.error)}</Text>;
+  }
+  const data = query.data;
+  if (!data) return null;
+  return (
+    <View
+      style={{
+        borderWidth: 1,
+        borderColor: colors.border,
+        borderRadius: radius.md,
+        backgroundColor: colors.surface1,
+        padding: space.md,
+        gap: space.sm,
+      }}
+    >
+      {data.truncated ? (
+        <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("subagents.artifactTruncated")}</Text>
+      ) : null}
+      {data.isMarkdown ? (
+        <Expandable colors={colors} height={360} background={colors.surface1} t={t}>
+          <Markdown>{data.content}</Markdown>
+        </Expandable>
+      ) : (
+        <Expandable colors={colors} height={280} background={colors.surface1} t={t}>
+          <Text selectable style={{ fontSize: 12, lineHeight: 17, fontFamily: mono, color: colors.foreground }}>
+            {data.content}
+          </Text>
+        </Expandable>
+      )}
+    </View>
   );
 }
 
@@ -468,15 +735,25 @@ function Detail({
   agentId,
   summary,
   compact,
+  onInsertReport,
 }: {
   colors: Colors;
   agentId: string;
   summary: SubagentSummary;
   compact: boolean;
+  onInsertReport(text: string): boolean;
 }) {
   const { t, locale } = useTranslation(messages);
   const toast = useToast();
   const read = useRpc(subagentDetailRpc);
+  const pricing = usePricing();
+  const overrides = pricing.data?.overrides ?? {};
+  const scrollRef = useRef<NativeScrollView | null>(null);
+  const [activityFilter, setActivityFilter] = useState<ActivityFilter>("all");
+  const [activitySearch, setActivitySearch] = useState("");
+  const [follow, setFollow] = useState(false);
+  const [openArtifact, setOpenArtifact] = useState<string | null>(null);
+
   const query = useQuery({
     queryKey: ["antigravity-accounts", "subagent", agentId, summary.id],
     queryFn: () => read({ agentId, subagentId: summary.id }),
@@ -485,21 +762,80 @@ function Detail({
   });
   const detail = query.data;
   const entries = detail?.entries ?? [];
+  const artifacts = detail?.artifacts ?? [];
   const task = entries.find((entry) => entry.kind === "task");
-  const activity = entries.filter((entry) => entry.kind !== "task");
+  const rawActivity = entries.filter((entry) => entry.kind !== "task");
+
+  const activity = useMemo(() => {
+    const q = activitySearch.trim().toLowerCase();
+    return rawActivity.filter((entry) => {
+      if (activityFilter === "tools" && entry.tools.length === 0) return false;
+      if (
+        activityFilter === "errors" &&
+        entry.kind !== "error" &&
+        !entry.tools.some((tool) => tool.failed)
+      ) {
+        return false;
+      }
+      if (!q) return true;
+      if ((entry.text ?? "").toLowerCase().includes(q)) return true;
+      if ((entry.thinking ?? "").toLowerCase().includes(q)) return true;
+      return entry.tools.some(
+        (tool) =>
+          tool.name.toLowerCase().includes(q) ||
+          tool.summary.toLowerCase().includes(q) ||
+          (tool.output ?? "").toLowerCase().includes(q),
+      );
+    });
+  }, [rawActivity, activityFilter, activitySearch]);
+
+  useEffect(() => {
+    if (follow && summary.state === "running") {
+      scrollRef.current?.scrollToEnd({ animated: true });
+    }
+  }, [follow, summary.state, activity.length]);
+
   const pad = compact ? space.lg : space.xxl;
-  const took = since(summary.startedAt, summary.reportedAt ?? summary.updatedAt, locale);
-  const facts = [summary.model, t("subagents.steps", { count: summary.steps }), t("subagents.calls", { count: summary.tools }), took]
+  const end =
+    summary.reportedAt && summary.updatedAt
+      ? Date.parse(summary.reportedAt) >= Date.parse(summary.updatedAt)
+        ? summary.reportedAt
+        : summary.updatedAt
+      : (summary.reportedAt ?? summary.updatedAt);
+  const took = since(summary.startedAt, end, locale);
+  const estCost = estimateSubagentCost(summary, overrides);
+  const facts = [
+    summary.model,
+    t("subagents.steps", { count: summary.steps }),
+    t("subagents.calls", { count: summary.tools }),
+    took,
+    estCost !== null ? `~${usd(estCost, locale)}` : null,
+  ]
     .filter(Boolean)
     .join(" · ");
 
   return (
-    <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: pad, gap: space.xl }}>
+    <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={{ padding: pad, gap: space.xl }}>
       <View style={{ gap: space.sm }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, flexWrap: "wrap" }}>
           <Text style={{ ...font.title, color: colors.foreground }}>{summary.role ?? summary.type ?? summary.id.slice(0, 8)}</Text>
           {summary.type && summary.role ? <Badge colors={colors} label={summary.type} /> : null}
           <Badge colors={colors} label={t(`subagents.state.${summary.state}`)} tone={STATE_TONE[summary.state]} dot />
+          <View style={{ flex: 1 }} />
+          {entries.length > 0 ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={t("subagents.copyTranscript")}
+              onPress={() => {
+                const md = transcriptToMarkdown(summary, entries, detail?.report ?? null);
+                void copyText(md).then(() => toast.show(t("subagents.transcriptCopied"), { durationMs: 2500 }));
+              }}
+              style={{ flexDirection: "row", alignItems: "center", gap: 4, padding: space.xs }}
+            >
+              <Icon name="FileDown" size={14} color={colors.foregroundMuted} />
+              <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("subagents.copyTranscript")}</Text>
+            </Pressable>
+          ) : null}
         </View>
         <Text style={{ ...font.small, ...tabular, color: colors.foregroundMuted }}>{facts}</Text>
         <TokenBar colors={colors} summary={summary} t={t} />
@@ -520,16 +856,30 @@ function Detail({
           colors={colors}
           title={t("subagents.report")}
           trailing={
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={t("subagents.copy")}
-              onPress={() => {
-                void copyText(detail.report ?? "").then(() => toast.show(t("subagents.copied"), { durationMs: 2500 }));
-              }}
-              style={{ padding: space.xs }}
-            >
-              <Icon name="Copy" size={14} color={colors.foregroundMuted} />
-            </Pressable>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={t("subagents.insertReport")}
+                onPress={() => {
+                  const ok = onInsertReport(detail.report ?? "");
+                  toast.show(ok ? t("subagents.insertedReport") : t("subagents.composerUnavailable"), { durationMs: 2500 });
+                }}
+                style={{ flexDirection: "row", alignItems: "center", gap: 4, padding: space.xs }}
+              >
+                <Icon name="CornerDownLeft" size={14} color={colors.accent} />
+                <Text style={{ ...font.caption, color: colors.accent }}>{t("subagents.insertReport")}</Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={t("subagents.copy")}
+                onPress={() => {
+                  void copyText(detail.report ?? "").then(() => toast.show(t("subagents.copied"), { durationMs: 2500 }));
+                }}
+                style={{ padding: space.xs }}
+              >
+                <Icon name="Copy" size={14} color={colors.foregroundMuted} />
+              </Pressable>
+            </View>
           }
         >
           <View
@@ -549,14 +899,123 @@ function Detail({
         </Section>
       ) : null}
 
-      {activity.length ? (
-        <Section colors={colors} title={t("subagents.activity")}>
-          {detail?.truncated ? <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("subagents.truncated", { count: activity.length })}</Text> : null}
-          <View style={{ gap: space.md }}>
-            {activity.map((entry) => (
-              <EntryRow key={entry.index} colors={colors} entry={entry} t={t} locale={locale} />
-            ))}
+      {artifacts.length > 0 ? (
+        <Section colors={colors} title={`${t("subagents.artifacts")} (${artifacts.length})`}>
+          <View style={{ gap: space.xs }}>
+            {artifacts.map((artifact) => {
+              const expanded = openArtifact === artifact.path;
+              return (
+                <View key={artifact.path} style={{ gap: space.xs }}>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityState={{ expanded }}
+                    onPress={() => setOpenArtifact(expanded ? null : artifact.path)}
+                    style={(pressState) => ({
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: space.sm,
+                      paddingVertical: space.xs + 2,
+                      paddingHorizontal: space.sm,
+                      borderRadius: radius.md,
+                      borderWidth: 1,
+                      borderColor: expanded ? tint(colors.accent, 0.4) : colors.border,
+                      backgroundColor: (pressState as { hovered?: boolean }).hovered
+                        ? tint(colors.foreground, 0.04)
+                        : colors.surface1,
+                    })}
+                  >
+                    <Icon name={artifact.isMarkdown ? "FileText" : "File"} size={14} color={expanded ? colors.accent : colors.foregroundMuted} />
+                    <Text numberOfLines={1} style={{ ...font.small, fontFamily: mono, color: colors.foreground, flex: 1 }}>
+                      {artifact.path}
+                    </Text>
+                    <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
+                      {formatBytes(artifact.size)}
+                    </Text>
+                    <Icon name={expanded ? "ChevronDown" : "ChevronRight"} size={14} color={colors.foregroundMuted} />
+                  </Pressable>
+                  {expanded ? (
+                    <ArtifactPreview colors={colors} agentId={agentId} subagentId={summary.id} artifact={artifact} t={t} />
+                  ) : null}
+                </View>
+              );
+            })}
           </View>
+        </Section>
+      ) : null}
+
+      {rawActivity.length ? (
+        <Section
+          colors={colors}
+          title={t("subagents.activity")}
+          trailing={
+            <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
+              {summary.state === "running" ? (
+                <FilterChip colors={colors} label={t("subagents.follow")} active={follow} onPress={() => setFollow(!follow)} />
+              ) : null}
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => scrollRef.current?.scrollToEnd({ animated: true })}
+                style={{ flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: space.xs, height: 24 }}
+              >
+                <Icon name="ArrowDown" size={12} color={colors.accent} />
+                <Text style={{ ...font.caption, color: colors.accent }}>{t("subagents.jumpBottom")}</Text>
+              </Pressable>
+            </View>
+          }
+        >
+          <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.xs }}>
+            <FilterChip
+              colors={colors}
+              label={t("subagents.activityFilter.all")}
+              active={activityFilter === "all"}
+              onPress={() => setActivityFilter("all")}
+            />
+            <FilterChip
+              colors={colors}
+              label={t("subagents.activityFilter.tools")}
+              active={activityFilter === "tools"}
+              onPress={() => setActivityFilter("tools")}
+            />
+            <FilterChip
+              colors={colors}
+              label={t("subagents.activityFilter.errors")}
+              active={activityFilter === "errors"}
+              onPress={() => setActivityFilter("errors")}
+            />
+            <TextInput
+              accessibilityLabel={t("subagents.activitySearch")}
+              value={activitySearch}
+              onChangeText={setActivitySearch}
+              placeholder={t("subagents.activitySearch")}
+              placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
+              style={{
+                ...font.caption,
+                flex: 1,
+                minWidth: 140,
+                color: colors.foreground,
+                backgroundColor: colors.surface1,
+                borderWidth: 1,
+                borderColor: colors.border,
+                borderRadius: radius.md,
+                paddingHorizontal: space.sm,
+                paddingVertical: 4,
+              }}
+            />
+          </View>
+          {detail?.truncated ? (
+            <Text style={{ ...font.caption, color: colors.foregroundMuted }}>
+              {t("subagents.truncated", { count: rawActivity.length })}
+            </Text>
+          ) : null}
+          {activity.length === 0 ? (
+            <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("subagents.noMatches")}</Text>
+          ) : (
+            <View style={{ gap: space.md }}>
+              {activity.map((entry) => (
+                <EntryRow key={entry.index} colors={colors} entry={entry} t={t} locale={locale} />
+              ))}
+            </View>
+          )}
         </Section>
       ) : null}
     </ScrollView>

@@ -4,10 +4,13 @@ import { commandEnv } from "./agy";
 import { profileHome } from "./paths";
 
 const URL_PATTERN = /https:\/\/accounts\.google\.com\/[^\s"'<>]+/;
-const CALLBACK_ORIGIN = "https://antigravity.google/";
+const CALLBACK_ORIGIN = "https://antigravity.google";
 const PENDING_TTL_MS = 10 * 60 * 1000;
 const URL_WAIT_MS = 45_000;
 const SUBMIT_WAIT_MS = 90_000;
+
+/** Prefix used when pasted input is rejected locally so the client knows the sign-in session is still alive. */
+export const RETRYABLE_INPUT_PREFIX = "Invalid input: ";
 
 interface PendingSignIn {
   loginId: string;
@@ -45,24 +48,39 @@ function tail(text: string, lines = 6): string {
     .join("\n");
 }
 
+function inputError(message: string): Error {
+  return new Error(`${RETRYABLE_INPUT_PREFIX}${message}`);
+}
+
 /**
  * Validates what the user pasted: the code Google's page shows, or the full URL of that page.
  * Rejects anything with line breaks so nothing else can be typed into agy.
  */
 export function normalizeSignInResponse(pending: { state: string | null }, raw: string): string {
   const value = raw.trim();
-  if (/[\r\n]/.test(value)) throw new Error("Paste a single line: the code or the page URL.");
-  if (/^[\w./~-]{1,2048}$/.test(value) && !value.startsWith("http")) return value;
+  if (/[\r\n]/.test(value)) throw inputError("Paste a single line: the code or the page URL.");
+  // Raw OAuth codes may carry `/`, `+`, `=`, `-`, `_`, `~`, `.` or percent-encoded characters like `%2F`.
+  if (/^[\w./~+%=-]{1,2048}$/.test(value) && !/^https?:/i.test(value)) {
+    if (value.includes("%")) {
+      try {
+        const decoded = decodeURIComponent(value);
+        if (!/[\r\n]/.test(decoded) && /^[\w./~+=-]{1,2048}$/.test(decoded)) return decoded;
+      } catch {
+        // Leave as-is if not valid percent-encoding.
+      }
+    }
+    return value;
+  }
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    throw new Error("That is neither a sign-in code nor the URL of the Antigravity page.");
+    throw inputError("That is neither a sign-in code nor the URL of the Antigravity page.");
   }
-  if (!`${url.origin}/`.startsWith(CALLBACK_ORIGIN)) {
-    throw new Error("Paste the URL of the antigravity.google page Google sent you to.");
+  if (url.origin !== CALLBACK_ORIGIN) {
+    throw inputError("Paste the URL of the antigravity.google page Google sent you to.");
   }
-  if (!url.searchParams.get("code")) throw new Error("That URL carries no code.");
+  if (!url.searchParams.get("code")) throw inputError("That URL carries no code.");
   const state = url.searchParams.get("state");
   if (pending.state && state && state !== pending.state) {
     throw new Error("That URL belongs to a different sign-in. Start again.");
@@ -90,27 +108,42 @@ export class SignInManager {
       child.on("error", () => resolve(null));
     });
     const url = await new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        child.stdout.off("data", onData);
+        child.stderr.off("data", onData);
+        child.off("error", onError);
+      };
+      const done = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback();
+      };
       const timer = setTimeout(() => {
-        child.kill("SIGTERM");
-        reject(new Error(`agy did not print a sign-in link within ${URL_WAIT_MS / 1000} seconds. ${tail(output)}`));
+        done(() => {
+          child.kill("SIGTERM");
+          setTimeout(() => child.kill("SIGKILL"), 2000).unref?.();
+          reject(new Error(`agy did not print a sign-in link within ${URL_WAIT_MS / 1000} seconds. ${tail(output)}`));
+        });
       }, URL_WAIT_MS);
       const onData = (chunk: Buffer) => {
         output += chunk.toString("utf8");
+        if (output.length > 64 * 1024) output = output.slice(-32 * 1024);
         const match = URL_PATTERN.exec(output);
-        if (match) {
-          clearTimeout(timer);
-          resolve(match[0]);
-        }
+        if (match) done(() => resolve(match[0]));
+      };
+      const onError = (error: Error) => {
+        done(() => reject(new Error(`Could not start agy: ${error.message}`)));
       };
       child.stdout.on("data", onData);
       child.stderr.on("data", onData);
-      child.on("error", (error) => {
-        clearTimeout(timer);
-        reject(new Error(`Could not start agy: ${error.message}`));
-      });
+      child.on("error", onError);
       void exited.then((code) => {
-        clearTimeout(timer);
-        reject(new Error(`agy exited (code ${String(code)}) before printing a sign-in link. ${tail(output)}`));
+        done(() =>
+          reject(new Error(`agy exited (code ${String(code)}) before printing a sign-in link. ${tail(output)}`)),
+        );
       });
     });
     let state: string | null = null;
@@ -158,6 +191,7 @@ export class SignInManager {
     const entry = this.pending.get(loginId);
     if (!entry) throw new Error("This sign-in expired or was cancelled. Start again.");
     if (entry.submitting) throw new Error("This sign-in is already being completed.");
+    // Local validation throws before touching the child process so the user can fix a bad paste.
     const response = normalizeSignInResponse(entry, raw);
     entry.submitting = true;
     const before = entry.output.length;
@@ -170,6 +204,7 @@ export class SignInManager {
       ]);
       if (code === "timeout") {
         entry.child.kill("SIGTERM");
+        setTimeout(() => entry.child.kill("SIGKILL"), 2000).unref?.();
         return { exitedCleanly: false, submittedAt };
       }
       if (code !== 0) {

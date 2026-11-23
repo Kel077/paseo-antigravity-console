@@ -1,23 +1,31 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   cancelSignInRpc,
+  clearCooldownRpc,
   contextUsageRpc,
   createAccountRpc,
   getOrchestratorRpc,
+  getPricingRpc,
   listAccountsRpc,
   listSubagentsRpc,
+  migrateAccountAgentsRpc,
+  moveAccountRpc,
+  recoverSavedFilesRpc,
   refreshAccountsRpc,
   removeAccountRpc,
   renameAccountRpc,
   savedFilesRpc,
-  setFallbackRpc,
+  setAccountOptionsRpc,
   setDefaultAccountRpc,
+  setFallbackRpc,
   setOrchestratorRpc,
+  setPricingRpc,
   signOutAccountRpc,
   startSignInRpc,
-  submitSignInRpc,
+  subagentArtifactRpc,
   subagentCountsRpc,
   subagentDetailRpc,
+  submitSignInRpc,
   switchAgentAccountRpc,
   usageStatsRpc,
   watchAccountsSubscription,
@@ -25,10 +33,11 @@ import {
 import { AccountService } from "./server/accounts";
 import { ContextReader } from "./server/context";
 import { FallbackController } from "./server/fallback";
+import { PendingSwitches, migrateAccountAgents, registerHooks, switchAgentAccount } from "./server/hooks";
 import { OrchestratorSettings } from "./server/orchestrator";
-import { SubagentReader } from "./server/subagents";
+import { PricingStore } from "./server/pricing";
 import { UsageStatsReader } from "./server/stats";
-import { PendingSwitches, registerHooks, switchAgentAccount } from "./server/hooks";
+import { SubagentReader } from "./server/subagents";
 import { createUsageSource } from "./server/usage";
 
 export default function contribute(server: PluginServerContext) {
@@ -36,9 +45,10 @@ export default function contribute(server: PluginServerContext) {
   const pending = new PendingSwitches();
   const context = new ContextReader();
   const stats = new UsageStatsReader();
+  const pricing = new PricingStore();
   const subagents = new SubagentReader(context);
   const orchestrator = new OrchestratorSettings(service);
-  const ready = service.init();
+  const ready = Promise.all([service.init(), pricing.load()]).then(() => undefined);
 
   // Learn every account's state once in the background so the composer can show it.
   const warmup = setTimeout(() => {
@@ -60,15 +70,21 @@ export default function contribute(server: PluginServerContext) {
     void ready.then(() => service.refreshAll()).catch(() => undefined);
   }, 15 * 60_000);
 
-  const fallback = new FallbackController(service, pending);
-  const removers = registerHooks(server, service, pending, fallback);
+  const fallback = new FallbackController(service, pending, orchestrator);
+  const removers = registerHooks(server, service, pending, fallback, {
+    onConversationAccount: (conversationId, accountId) => stats.recordConversationAccount(conversationId, accountId),
+    onAgentArchived: (agentId) => {
+      context.forget(agentId);
+      subagents.forget(agentId);
+    },
+  });
   removers.push(fallback.register(server));
   removers.push(...orchestrator.register(server));
   server.registerUsageSource(createUsageSource(service));
 
   server.handle(listAccountsRpc, async ({ refresh }) => {
     await ready;
-    if (refresh) await service.refreshAll();
+    if (refresh) await service.refreshAll({ forcePlan: true });
     return service.state();
   });
 
@@ -76,9 +92,10 @@ export default function contribute(server: PluginServerContext) {
     await ready;
     if (accountId) {
       service.requireAccount(accountId);
-      await service.refreshOne(accountId);
+      await service.refreshOne(accountId, { forcePlan: true });
+      orchestrator.invalidateAccount(accountId);
     } else {
-      await service.refreshAll();
+      await service.refreshAll({ forcePlan: true });
     }
     return service.state();
   });
@@ -92,6 +109,25 @@ export default function contribute(server: PluginServerContext) {
   server.handle(renameAccountRpc, async ({ accountId, label }) => {
     await ready;
     await service.rename(accountId, label);
+    return service.state();
+  });
+
+  server.handle(moveAccountRpc, async ({ accountId, direction }) => {
+    await ready;
+    await service.move(accountId, direction);
+    return service.state();
+  });
+
+  server.handle(setAccountOptionsRpc, async ({ accountId, fallbackEnabled, orchestratorOverride }) => {
+    await ready;
+    await service.setAccountOptions(accountId, { fallbackEnabled, orchestratorOverride });
+    return service.state();
+  });
+
+  server.handle(clearCooldownRpc, async ({ accountId }) => {
+    await ready;
+    if (accountId) service.requireAccount(accountId);
+    fallback.clearCooldown(accountId);
     return service.state();
   });
 
@@ -112,14 +148,24 @@ export default function contribute(server: PluginServerContext) {
     return service.savedFiles(accountId);
   });
 
+  server.handle(recoverSavedFilesRpc, async ({ accountId }) => {
+    await ready;
+    const moved = await service.recoverSavedFiles(accountId);
+    return { moved };
+  });
+
   server.handle(removeAccountRpc, async ({ accountId }) => {
     await ready;
+    fallback.clearCooldown(accountId);
+    orchestrator.invalidateAccount(accountId);
     const moved = await service.remove(accountId);
     return { state: await service.state(), moved };
   });
 
   server.handle(signOutAccountRpc, async ({ accountId }) => {
     await ready;
+    fallback.clearCooldown(accountId);
+    orchestrator.invalidateAccount(accountId);
     await service.signOut(accountId);
     return service.state();
   });
@@ -131,7 +177,12 @@ export default function contribute(server: PluginServerContext) {
 
   server.handle(submitSignInRpc, async ({ loginId, code }) => {
     await ready;
+    const accountId = service.signIns.accountOf(loginId);
     await service.submitSignIn(loginId, code);
+    if (accountId) {
+      fallback.clearCooldown(accountId);
+      orchestrator.invalidateAccount(accountId);
+    }
     return service.state();
   });
 
@@ -142,10 +193,33 @@ export default function contribute(server: PluginServerContext) {
 
   server.handle(switchAgentAccountRpc, async (input, { paseo }) => {
     await ready;
-    return switchAgentAccount(paseo, service, pending, input);
+    fallback.clearCooldown(input.accountId);
+    return switchAgentAccount(paseo, service, pending, { ...input, manual: true });
   });
 
-  server.handle(usageStatsRpc, async ({ range }) => stats.summary(range));
+  server.handle(migrateAccountAgentsRpc, async (input, { paseo }) => {
+    await ready;
+    fallback.clearCooldown(input.toAccountId);
+    return migrateAccountAgents(paseo, service, pending, input);
+  });
+
+  server.handle(usageStatsRpc, async (filter) => {
+    await ready;
+    return stats.summary(filter, (id) => service.labelOf(id), pricing.snapshot());
+  });
+
+  server.handle(getPricingRpc, async () => {
+    await ready;
+    const seen = await stats.seenPricingModels().catch(() => new Map<string, string>());
+    return pricing.state(seen);
+  });
+
+  server.handle(setPricingRpc, async (input) => {
+    await ready;
+    await pricing.update(input);
+    const seen = await stats.seenPricingModels().catch(() => new Map<string, string>());
+    return pricing.state(seen);
+  });
 
   server.handle(contextUsageRpc, async ({ agentIds }, { paseo }) => context.usage(paseo, agentIds));
 
@@ -159,14 +233,18 @@ export default function contribute(server: PluginServerContext) {
     subagents.detail(paseo, agentId, subagentId),
   );
 
+  server.handle(subagentArtifactRpc, async ({ agentId, subagentId, path: artifactPath }, { paseo }) =>
+    subagents.artifact(paseo, agentId, subagentId, artifactPath),
+  );
+
   server.handle(getOrchestratorRpc, async ({ refresh }) => {
     await ready;
     return orchestrator.state(refresh ?? false);
   });
 
-  server.handle(setOrchestratorRpc, async ({ planner, executor, applyTo }, { paseo }) => {
+  server.handle(setOrchestratorRpc, async ({ planner, executor, accountId, inheritGlobal, applyTo }, { paseo }) => {
     await ready;
-    const state = await orchestrator.save({ planner, executor });
+    const state = await orchestrator.save({ planner, executor, accountId, inheritGlobal });
     const applied = applyTo ? await orchestrator.apply(paseo, applyTo) : "none";
     return { state, applied };
   });
@@ -186,6 +264,7 @@ export default function contribute(server: PluginServerContext) {
     clearInterval(sweepTimer);
     for (const remove of removers) remove();
     fallback.dispose();
+    stats.dispose();
     service.dispose();
   };
 }

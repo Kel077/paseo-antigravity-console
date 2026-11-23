@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { PaseoApi } from "./types";
 import type {
+  SubagentArtifactInfo,
   SubagentDetail,
   SubagentList,
   SubagentState,
@@ -10,6 +10,7 @@ import type {
 } from "../shared/contracts";
 import type { ContextReader } from "./context";
 import { REAL_CLI_DIR } from "./paths";
+import type { PaseoApi } from "./types";
 
 /**
  * agy runs subagents as conversations of their own. Every conversation keeps a JSON-lines log at
@@ -25,6 +26,8 @@ const TIME_HEADER = /^(?:(?:Created|Completed) At: [^\n]*\n)+/;
 const STALE_MS = 12 * 60_000;
 const MAX_DEPTH = 3;
 const MAX_ENTRIES = 300;
+const MAX_LOG_CACHE = 120;
+const MAX_ARTIFACT_BYTES = 256 * 1024;
 /** Step states agy may still rewrite in place. */
 const UNFINISHED = new Set(["RUNNING", "PENDING", "GENERATING", "WAITING", "QUEUED"]);
 /** How far back an unfinished step is looked for when resuming a read. */
@@ -55,7 +58,7 @@ interface Child {
   role: string | null;
   type: string | null;
   task: string;
-  /** Set when the parent stopped it with `manage_subagents` (`kill`). */
+  /** Set when the parent stopped it with `manage_subagents` (`kill` or `kill_all`). */
   killedAt: string | null;
 }
 
@@ -67,12 +70,16 @@ interface CachedLog {
   starts: number[];
 }
 
+function brainDir(conversationId: string): string {
+  return path.join(REAL_CLI_DIR, "brain", conversationId);
+}
+
 function logPath(conversationId: string): string {
-  return path.join(REAL_CLI_DIR, "brain", conversationId, ".system_generated", "logs", "transcript.jsonl");
+  return path.join(brainDir(conversationId), ".system_generated", "logs", "transcript.jsonl");
 }
 
 function inboxDir(conversationId: string): string {
-  return path.join(REAL_CLI_DIR, "brain", conversationId, ".system_generated", "messages");
+  return path.join(brainDir(conversationId), ".system_generated", "messages");
 }
 
 /**
@@ -193,11 +200,56 @@ function listedRoles(content: string): Map<string, { role: string | null; type: 
   return result;
 }
 
+function parseTime(iso: string | null | undefined): number {
+  if (!iso) return NaN;
+  return Date.parse(iso);
+}
+
+/** Lists user-facing artifact files saved directly under a subagent's brain directory. */
+async function listArtifacts(conversationId: string): Promise<SubagentArtifactInfo[]> {
+  const root = brainDir(conversationId);
+  const found: SubagentArtifactInfo[] = [];
+  async function walk(dir: string, depth: number): Promise<void> {
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isSymbolicLink() || entry.name.startsWith(".")) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (depth < 2) await walk(full, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (entry.name.endsWith(".metadata.json") || entry.name.endsWith(".resolved")) continue;
+      const stat = await fs.stat(full).catch(() => null);
+      if (!stat) continue;
+      const rel = path.relative(root, full).split(path.sep).join("/");
+      found.push({
+        path: rel,
+        name: entry.name,
+        size: stat.size,
+        updatedAt: new Date(stat.mtimeMs).toISOString(),
+        isMarkdown: /\.(md|markdown)$/i.test(entry.name),
+      });
+    }
+  }
+  await walk(root, 0);
+  return found.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 40);
+}
+
 export class SubagentReader {
   private readonly logs = new Map<string, CachedLog>();
   private readonly listCache = new Map<string, { at: number; value: SubagentList }>();
 
   constructor(private readonly agents: ContextReader) {}
+
+  private rememberLog(file: string, entry: CachedLog): void {
+    this.logs.delete(file);
+    this.logs.set(file, entry);
+    if (this.logs.size > MAX_LOG_CACHE) {
+      const oldest = this.logs.keys().next().value;
+      if (oldest) this.logs.delete(oldest);
+    }
+  }
 
   /**
    * Reads a conversation log incrementally. agy appends a line per step and rewrites a step's line
@@ -209,6 +261,7 @@ export class SubagentReader {
     if (!stat?.isFile()) return null;
     const cached = this.logs.get(file);
     if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+      this.rememberLog(file, cached);
       return { rows: cached.rows, mtimeMs: stat.mtimeMs };
     }
     let keep = 0;
@@ -235,7 +288,7 @@ export class SubagentReader {
         }
       : { size: stat.size, mtimeMs: stat.mtimeMs, ...((await readRows(file, 0, stat.size)) ?? { rows: [], starts: [] }) };
     dedupe(next);
-    this.logs.set(file, next);
+    this.rememberLog(file, next);
     return { rows: next.rows, mtimeMs: stat.mtimeMs };
   }
 
@@ -248,7 +301,7 @@ export class SubagentReader {
     const log = await this.rows(conversationId);
     if (!log) return [];
     const found: Child[] = [];
-    const killed = new Map<string, string | null>();
+    const killed = new Map<string, string>();
     const listed = new Map<string, { role: string | null; type: string | null }>();
     let queue: ToolCall[] = [];
     for (const row of log.rows) {
@@ -256,10 +309,19 @@ export class SubagentReader {
         // A result that never arrived must not shift the next response's pairing.
         queue = [...(row.tool_calls ?? [])];
         for (const call of queue) {
-          if (call.name !== "manage_subagents" || argText(call, "Action") !== "kill") continue;
-          const ids = argValue(call.args?.ConversationIds);
-          for (const id of Array.isArray(ids) ? ids : []) {
-            if (typeof id === "string") killed.set(id, row.created_at ?? null);
+          if (call.name !== "manage_subagents") continue;
+          const action = argText(call, "Action");
+          const at = row.created_at ?? "";
+          if (action === "kill") {
+            const ids = argValue(call.args?.ConversationIds);
+            for (const id of Array.isArray(ids) ? ids : []) {
+              if (typeof id === "string") killed.set(id, at);
+            }
+          } else if (action === "kill_all") {
+            // Every subagent spawned before this `kill_all` call was terminated.
+            for (const child of found) {
+              if (!killed.has(child.id)) killed.set(child.id, at);
+            }
           }
         }
         continue;
@@ -332,12 +394,17 @@ export class SubagentReader {
     let cached = 0;
     let model: string | null = null;
     let lastCall: ToolCall | null = null;
+    let lastInputTime = NaN;
     for (const row of rows) {
       tools += row.tool_calls?.length ?? 0;
       input += row.input_tokens ?? 0;
       output += row.output_tokens ?? 0;
       cached += row.cache_read_tokens ?? 0;
       if (row.model) model = row.model;
+      if (row.type === "SYSTEM_MESSAGE" || row.type === "USER_INPUT") {
+        const at = parseTime(row.created_at);
+        if (Number.isFinite(at)) lastInputTime = at;
+      }
       const calls = row.tool_calls ?? [];
       if (calls.length) lastCall = calls[calls.length - 1]!;
     }
@@ -347,15 +414,20 @@ export class SubagentReader {
       .catch(() => fs.stat(path.join(REAL_CLI_DIR, "conversations", `${child.id}.db`)).catch(() => null));
     const touched = Math.max(log?.mtimeMs ?? 0, dbStat?.mtimeMs ?? 0);
     const finalAnswer = last?.type === "PLANNER_RESPONSE" && last.status === "DONE" && !(last.tool_calls?.length);
+    // A report only covers the latest turn if it was sent after (or alongside) the latest input to the subagent.
+    const reportedMs = parseTime(reported?.at);
+    const reportedCurrentTurn = Boolean(
+      reported && (!Number.isFinite(lastInputTime) || !Number.isFinite(reportedMs) || reportedMs >= lastInputTime - 2000),
+    );
     // A tool error is routine; an error in the model's own step ends the run.
     const failed = Boolean(last && (last.type?.includes("ERROR") || (last.status === "ERROR" && last.type !== "GENERIC")));
     let state: SubagentState;
     let phase: "thinking" | "tool" | null = null;
-    if (child.killedAt !== null && !(finalAnswer && reported)) state = "stopped";
+    if (child.killedAt !== null && !(finalAnswer && reportedCurrentTurn)) state = "stopped";
     else if (!last) state = parentClosed ? "stopped" : "running";
     else if (last.status === "CANCELED" || last.status === "INTERRUPTED") state = "stopped";
     else if (failed) state = "failed";
-    else if (finalAnswer) state = reported ? "done" : parentClosed ? "stopped" : "idle";
+    else if (finalAnswer) state = reportedCurrentTurn ? "done" : parentClosed ? "stopped" : "idle";
     else {
       state = "running";
       phase = last.type === "PLANNER_RESPONSE" && last.tool_calls?.length && last.status === "DONE" ? "tool" : "thinking";
@@ -371,6 +443,7 @@ export class SubagentReader {
         : lastCall
           ? `${lastCall.name}${describeCall(lastCall) ? ` · ${describeCall(lastCall)}` : ""}`
           : null;
+    const updatedAt = last?.created_at ?? (touched ? new Date(touched).toISOString() : null);
     return {
       id: child.id,
       parentId,
@@ -389,8 +462,8 @@ export class SubagentReader {
       outputTokens: output,
       cachedTokens: cached,
       startedAt: rows[0]?.created_at ?? null,
-      updatedAt: last?.created_at ?? (touched ? new Date(touched).toISOString() : null),
-      reportedAt: reported?.at ?? null,
+      updatedAt,
+      reportedAt: reportedCurrentTurn ? (reported?.at ?? null) : null,
     };
   }
 
@@ -445,8 +518,12 @@ export class SubagentReader {
     const list = await this.list(paseo, agentId);
     const summary = list.subagents.find((subagent) => subagent.id === subagentId) ?? null;
     // Only conversations this agent created can be read through it.
-    if (!summary) return { summary: null, entries: [], report: null, truncated: false };
-    const log = await this.rows(subagentId);
+    if (!summary) return { summary: null, entries: [], report: null, artifacts: [], truncated: false };
+    const [log, inbox, artifacts] = await Promise.all([
+      this.rows(subagentId),
+      this.reports(summary.parentId),
+      listArtifacts(subagentId),
+    ]);
     const rows = log?.rows ?? [];
     const entries: TranscriptEntry[] = [];
     const open: TranscriptEntry["tools"] = [];
@@ -477,7 +554,7 @@ export class SubagentReader {
         open.push(...tools);
         entries.push({
           index: row.step_index,
-          kind: "response",
+          kind: row.status === "ERROR" ? "error" : "response",
           at: row.created_at ?? null,
           text: clip(row.content, 4000),
           thinking: clip(row.thinking, 1500),
@@ -494,7 +571,7 @@ export class SubagentReader {
         }
         continue;
       }
-      if (row.type?.includes("ERROR")) {
+      if (row.type?.includes("ERROR") || row.status === "ERROR") {
         entries.push({
           index: row.step_index,
           kind: "error",
@@ -506,7 +583,6 @@ export class SubagentReader {
         });
       }
     }
-    const inbox = await this.reports(summary.parentId);
     const full = inbox.get(subagentId)?.content ?? null;
     const truncated = entries.length > MAX_ENTRIES;
     const task = entries[0]?.kind === "task" ? entries[0] : null;
@@ -515,11 +591,66 @@ export class SubagentReader {
       // Keep the task when only the latest steps fit.
       entries: truncated ? [...(task ? [task] : []), ...entries.slice(-(MAX_ENTRIES - 1))] : entries,
       report: full ?? report,
+      artifacts,
       truncated,
     };
   }
 
+  /** Reads a text artifact written by a subagent inside its own brain folder (never follows symlinks). */
+  async artifact(
+    paseo: PaseoApi,
+    agentId: string,
+    subagentId: string,
+    relativePath: string,
+  ): Promise<{ path: string; content: string; truncated: boolean; isMarkdown: boolean }> {
+    const list = await this.list(paseo, agentId);
+    if (!list.subagents.some((subagent) => subagent.id === subagentId)) {
+      throw new Error("That subagent does not belong to this agent.");
+    }
+    const root = brainDir(subagentId);
+    const cleaned = relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
+    const parts = cleaned.split("/");
+    if (!cleaned || parts.some((part) => !part || part === "." || part === ".." || part.startsWith("."))) {
+      throw new Error("Invalid artifact path.");
+    }
+    const target = path.resolve(root, cleaned);
+    if (!target.startsWith(root + path.sep)) throw new Error("Invalid artifact path.");
+    // Verify every segment from root to target is not a symlink.
+    let current = root;
+    for (const part of parts) {
+      current = path.join(current, part);
+      const stat = await fs.lstat(current).catch(() => null);
+      if (!stat || stat.isSymbolicLink()) throw new Error("Artifact could not be read.");
+    }
+    const stat = await fs.stat(target);
+    if (!stat.isFile()) throw new Error("Artifact is not a file.");
+    const handle = await fs.open(target, "r");
+    try {
+      const toRead = Math.min(stat.size, MAX_ARTIFACT_BYTES);
+      const buffer = Buffer.alloc(toRead);
+      let filled = 0;
+      while (filled < toRead) {
+        const { bytesRead } = await handle.read(buffer, filled, toRead - filled, filled);
+        if (bytesRead <= 0) break;
+        filled += bytesRead;
+      }
+      return {
+        path: cleaned,
+        content: buffer.subarray(0, filled).toString("utf8"),
+        truncated: stat.size > MAX_ARTIFACT_BYTES,
+        isMarkdown: /\.(md|markdown)$/i.test(cleaned),
+      };
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
   forget(agentId: string): void {
+    const cached = this.listCache.get(agentId);
+    if (cached) {
+      if (cached.value.conversationId) this.logs.delete(logPath(cached.value.conversationId));
+      for (const subagent of cached.value.subagents) this.logs.delete(logPath(subagent.id));
+    }
     this.listCache.delete(agentId);
   }
 }
@@ -530,19 +661,25 @@ async function readRows(file: string, from: number, to: number): Promise<{ rows:
   const buffer = Buffer.alloc(length);
   const handle = await fs.open(file, "r").catch(() => null);
   if (!handle) return null;
+  let totalRead = 0;
   try {
-    if (length > 0) await handle.read(buffer, 0, length, from);
+    while (totalRead < length) {
+      const { bytesRead } = await handle.read(buffer, totalRead, length - totalRead, from + totalRead);
+      if (bytesRead <= 0) break;
+      totalRead += bytesRead;
+    }
   } finally {
     await handle.close();
   }
+  const view = buffer.subarray(0, totalRead);
   const rows: Row[] = [];
   const starts: number[] = [];
   let start = 0;
   for (;;) {
-    const newline = buffer.indexOf(0x0a, start);
+    const newline = view.indexOf(0x0a, start);
     // A line without its newline is still being written: leave it for the next read.
     if (newline < 0) break;
-    const line = buffer.subarray(start, newline).toString("utf8").trim();
+    const line = view.subarray(start, newline).toString("utf8").trim();
     if (line) {
       try {
         const row = JSON.parse(line) as Row;
