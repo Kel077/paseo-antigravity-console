@@ -25,7 +25,7 @@
 - 每次在添加的账号上启动前，插件会把 agy 的 `settings.json` 原子复制到该账号的 profile 里，并合并该账号单独配置的 Orchestrator 覆写项。
 - 选择全局 planner 或 executor 时，插件会写入 `~/.gemini/antigravity-cli/settings.json` 里的 `orchestrator` 项。
 - 查询额度和套餐、读取模型列表和登录都会在 daemon 所在机器上运行 agy CLI。用量、上下文和子代理视图读取 `~/.gemini/antigravity-cli` 下 agy 自己的对话记录、产物文件和日志。
-- 插件本身不发起任何网络请求，也不向任何地方发送数据；agy 照常与 Google 通信。插件从不读取钥匙串。账号列表、状态缓存和对话账号归因映射保存在 Paseo 的插件数据目录里。
+- 插件本身不发起任何网络请求，也不向任何地方发送数据；agy 照常与 Google 通信。插件从不读取钥匙串。账号列表、状态缓存、自定义价格配置和对话账号归因映射保存在 Paseo 的插件数据目录里。
 
 ## 限制
 

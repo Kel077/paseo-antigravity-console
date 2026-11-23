@@ -208,6 +208,8 @@ function parseTime(iso: string | null | undefined): number {
 /** Lists user-facing artifact files saved directly under a subagent's brain directory. */
 async function listArtifacts(conversationId: string): Promise<SubagentArtifactInfo[]> {
   const root = brainDir(conversationId);
+  const rootStat = await fs.lstat(root).catch(() => null);
+  if (!rootStat?.isDirectory()) return [];
   const found: SubagentArtifactInfo[] = [];
   async function walk(dir: string, depth: number): Promise<void> {
     const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
@@ -608,6 +610,8 @@ export class SubagentReader {
       throw new Error("That subagent does not belong to this agent.");
     }
     const root = brainDir(subagentId);
+    const rootStat = await fs.lstat(root).catch(() => null);
+    if (!rootStat?.isDirectory()) throw new Error("Artifact could not be read.");
     const cleaned = relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
     const parts = cleaned.split("/");
     if (!cleaned || parts.some((part) => !part || part === "." || part === ".." || part.startsWith("."))) {
@@ -615,17 +619,20 @@ export class SubagentReader {
     }
     const target = path.resolve(root, cleaned);
     if (!target.startsWith(root + path.sep)) throw new Error("Invalid artifact path.");
-    // Verify every segment from root to target is not a symlink.
+    // Verify every segment from root to target is a real directory or file, never a symlink.
     let current = root;
-    for (const part of parts) {
-      current = path.join(current, part);
-      const stat = await fs.lstat(current).catch(() => null);
-      if (!stat || stat.isSymbolicLink()) throw new Error("Artifact could not be read.");
+    for (let i = 0; i < parts.length; i += 1) {
+      current = path.join(current, parts[i]!);
+      const entryStat = await fs.lstat(current).catch(() => null);
+      if (!entryStat || entryStat.isSymbolicLink()) throw new Error("Artifact could not be read.");
+      if (i < parts.length - 1 ? !entryStat.isDirectory() : !entryStat.isFile()) {
+        throw new Error(i < parts.length - 1 ? "Artifact could not be read." : "Artifact is not a file.");
+      }
     }
-    const stat = await fs.stat(target);
-    if (!stat.isFile()) throw new Error("Artifact is not a file.");
     const handle = await fs.open(target, "r");
     try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error("Artifact is not a file.");
       const toRead = Math.min(stat.size, MAX_ARTIFACT_BYTES);
       const buffer = Buffer.alloc(toRead);
       let filled = 0;

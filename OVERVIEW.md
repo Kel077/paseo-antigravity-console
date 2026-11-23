@@ -25,7 +25,7 @@ To add an account, open Antigravity Console from the Command Center or the sideb
 - Before each launch on an added account, the plugin atomically copies agy's `settings.json` into that account's profile and merges any per-account Orchestrator override, so every account uses the same base preferences.
 - Choosing a global planner or executor writes the `orchestrator` entry of `~/.gemini/antigravity-cli/settings.json`.
 - Quota, plans, model lists, and sign-in run the agy CLI on the daemon host. Usage, context, and subagent views read agy's conversation records, artifacts, and logs under `~/.gemini/antigravity-cli`.
-- The plugin makes no network requests of its own and sends no data anywhere; agy talks to Google as it always does. It never reads the keychain. The account list, status cache, and conversation-to-account attribution map are kept in Paseo's plugin data folder.
+- The plugin makes no network requests of its own and sends no data anywhere; agy talks to Google as it always does. It never reads the keychain. The account list, status cache, custom price overrides, and conversation-to-account attribution map are kept in Paseo's plugin data folder.
 
 ## Limits
 
