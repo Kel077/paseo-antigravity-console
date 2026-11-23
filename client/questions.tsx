@@ -3,11 +3,12 @@ import {
   useComposers,
   usePaseo,
   useTranslation,
+  type PluginSurfaceProps,
   type PluginTimelineItemProps,
 } from "@getpaseo/plugin/client";
 import { Icon, Markdown, TextInput, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { isAntigravityProvider, type AskQuestionCard, type AskQuestionEntry } from "../shared/contracts";
 import { errorMessage, messages } from "./messages";
@@ -26,6 +27,7 @@ import { font, radius, space, tint, type Colors } from "./theme";
 import { Badge, Card } from "./ui";
 
 type PressState = { pressed: boolean; hovered?: boolean };
+type Layout = PluginSurfaceProps["layout"];
 
 /** Optimistic client-side memory of answers submitted from this session so the card settles immediately. */
 const submittedByKey = new Map<string, QuestionResolution>();
@@ -37,6 +39,14 @@ function rememberSubmitted(key: string, resolution: QuestionResolution) {
     const oldest = submittedByKey.keys().next().value;
     if (oldest) submittedByKey.delete(oldest);
   }
+}
+
+function isQuestionEchoMessage(text: string, echoSignature: string, allowPrefix: boolean): boolean {
+  if (!echoSignature) return false;
+  const normalized = normalizeEchoText(text);
+  if (!normalized) return false;
+  if (normalized === echoSignature) return true;
+  return allowPrefix && echoSignature.startsWith(normalized);
 }
 
 function SelectionIndicator({
@@ -143,139 +153,32 @@ function SettledQuestionCard({
   );
 }
 
-export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: PluginTimelineItemProps<AskQuestionCard>) {
-  const { colors } = theme;
+function PendingQuestionForm({
+  agentId,
+  cacheKey,
+  colors,
+  layout,
+  questions,
+  onResolved,
+}: {
+  agentId: string;
+  cacheKey: string;
+  colors: Colors;
+  layout: Layout;
+  questions: readonly AskQuestionEntry[];
+  onResolved(next: QuestionResolution): void;
+}) {
   const { t } = useTranslation(messages);
   const paseo = usePaseo();
   const toast = useToast();
   const composers = useComposers({ agentId });
-  const { callId, questions, output, status: callStatus } = item.data;
-  const cacheKey = `${agentId}:${callId}`;
-
-  const agentState = useAgent(
-    agentId,
-    (agent) => `${agent.provider}|${agent.status}|${agent.lastActivityAt}`,
-  );
-  const [provider = "", agentStatus = "", lastActivityAt = ""] = (agentState ?? "").split("|");
-  const antigravity = !provider || isAntigravityProvider(provider);
-
-  const [localResolution, setLocalResolution] = useState<QuestionResolution | null>(
-    () => submittedByKey.get(cacheKey) ?? null,
-  );
-  const outputResolution = useMemo(() => resolutionFromToolOutput(questions, output), [questions, output]);
-  const echoSignature = useMemo(() => formatQuestionEcho(questions), [questions]);
-
-  const needsTimelineCheck =
-    antigravity &&
-    !localResolution &&
-    !outputResolution &&
-    callStatus !== "failed" &&
-    callStatus !== "canceled";
-
-  const timelineQuery = useQuery({
-    queryKey: ["antigravity-accounts", "ask-question", agentId, lastActivityAt],
-    queryFn: () => paseo.agents.ref(agentId).timeline.refetch({ direction: "tail", limit: 40 }),
-    enabled: needsTimelineCheck,
-    staleTime: 1000,
-    refetchInterval: (query) => {
-      const data = query.state.data;
-      if (!data) return false;
-      const idx = data.entries.findIndex(
-        (entry) => entry.item.type === "tool_call" && entry.item.callId === callId,
-      );
-      if (idx < 0) return data.hasOlder ? false : 3000;
-      for (let cursor = idx + 1; cursor < data.entries.length; cursor += 1) {
-        const next = data.entries[cursor]!.item;
-        if (next.type === "user_message") return false;
-        if (next.type === "assistant_message" && normalizeEchoText(next.text) === echoSignature) continue;
-        if (next.type === "tool_call" || next.type === "reasoning" || next.type === "assistant_message") {
-          return false;
-        }
-      }
-      return agentStatus === "closed" ? false : 3000;
-    },
-  });
-
-  const resolved: QuestionResolution = useMemo(() => {
-    if (localResolution) return localResolution;
-    if (outputResolution) return outputResolution;
-    if (!antigravity) return { state: "settled" };
-    if (callStatus === "failed" || callStatus === "canceled") return { state: "settled" };
-    if (agentStatus === "closed") return { state: "settled" };
-
-    const data = timelineQuery.data;
-    if (!data) {
-      // If the agent already had much later activity, avoid flashing an interactive form while the tail loads.
-      const itemTime = timestamp.getTime();
-      const latestTime = lastActivityAt ? Date.parse(lastActivityAt) : NaN;
-      const hasLaterActivity =
-        Number.isFinite(itemTime) && Number.isFinite(latestTime) && latestTime - itemTime > 12_000;
-      if (hasLaterActivity) {
-        return timelineQuery.isError ? { state: "settled" } : { state: "loading" };
-      }
-      return { state: "pending" };
-    }
-
-    const entries = data.entries;
-    const index = entries.findIndex(
-      (entry) => entry.item.type === "tool_call" && entry.item.callId === callId,
-    );
-    if (index < 0) {
-      return data.hasOlder ? { state: "settled" } : { state: "pending" };
-    }
-
-    for (let cursor = index + 1; cursor < entries.length; cursor += 1) {
-      const next = entries[cursor]!.item;
-      if (next.type === "user_message") {
-        return resolutionFromUserReply(questions, next.text);
-      }
-      if (next.type === "assistant_message" && normalizeEchoText(next.text) === echoSignature) {
-        continue;
-      }
-      if (next.type === "tool_call" || next.type === "reasoning" || next.type === "assistant_message") {
-        return { state: "settled" };
-      }
-    }
-    return { state: "pending" };
-  }, [
-    localResolution,
-    outputResolution,
-    antigravity,
-    callStatus,
-    agentStatus,
-    timelineQuery.data,
-    timelineQuery.isError,
-    timestamp,
-    lastActivityAt,
-    callId,
-    questions,
-    echoSignature,
-  ]);
 
   const [activeIndex, setActiveIndex] = useState(0);
   const [selections, setSelections] = useState<Record<number, Set<number>>>({});
   const [customTexts, setCustomTexts] = useState<Record<number, string>>({});
   const [submitting, setSubmitting] = useState<"submit" | "skip" | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
-
-  if (questions.length === 0) return null;
-
-  if (resolved.state === "loading") {
-    return (
-      <Card colors={colors} style={{ paddingVertical: space.sm + 2, paddingHorizontal: space.md, gap: space.xs }}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-          <ActivityIndicator size="small" color={colors.foregroundMuted} />
-          <Text numberOfLines={1} style={{ ...font.small, color: colors.foreground, flex: 1 }}>
-            {questions[0]!.question}
-          </Text>
-        </View>
-      </Card>
-    );
-  }
-
-  if (resolved.state !== "pending") {
-    return <SettledQuestionCard colors={colors} questions={questions} resolution={resolved} />;
-  }
+  const inFlightRef = useRef(false);
 
   const safeIndex = Math.min(activeIndex, questions.length - 1);
   const current = questions[safeIndex]!;
@@ -328,9 +231,10 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
   }
 
   async function submitAnswer() {
-    if (busy || !allAnswered) return;
+    if (inFlightRef.current || busy || !allAnswered) return;
     const { wireText, perQuestionDisplay } = buildSubmission(questions, selections, customTexts);
     if (!wireText.trim()) return;
+    inFlightRef.current = true;
     setSubmitting("submit");
     setSubmitError(null);
     try {
@@ -341,32 +245,35 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
         fallbackText: null,
       };
       rememberSubmitted(cacheKey, next);
-      setLocalResolution(next);
+      onResolved(next);
     } catch (error) {
       setSubmitError(errorMessage(error));
     } finally {
+      inFlightRef.current = false;
       setSubmitting(null);
     }
   }
 
   async function skipQuestion() {
-    if (busy) return;
+    if (inFlightRef.current || busy) return;
+    inFlightRef.current = true;
     setSubmitting("skip");
     setSubmitError(null);
     try {
       await paseo.agents.ref(agentId).send(SKIPPED_REPLY, { activeTurnBehavior: "steer" });
       const next: QuestionResolution = { state: "skipped" };
       rememberSubmitted(cacheKey, next);
-      setLocalResolution(next);
+      onResolved(next);
     } catch (error) {
       setSubmitError(errorMessage(error));
     } finally {
+      inFlightRef.current = false;
       setSubmitting(null);
     }
   }
 
   function handlePrimaryAction() {
-    if (busy) return;
+    if (inFlightRef.current || busy) return;
     if (!isLast) {
       if (!currentAnswered) return;
       const nextUnanswered = questions.findIndex(
@@ -498,7 +405,7 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
                 })}
               >
                 <SelectionIndicator colors={colors} selected={selected} multiSelect={current.multiSelect} />
-                <View style={{ flex: 1, gap: 4 }}>
+                <View style={{ flex: 1, minWidth: 0, gap: 4 }}>
                   <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }}>
                     {option.recommended ? (
                       <Badge colors={colors} tone="accent" label={t("questions.recommended")} />
@@ -527,7 +434,6 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
         editable={!busy}
         onChangeText={(value) => changeCustomText(safeIndex, value, current.multiSelect)}
         onSubmitEditing={handlePrimaryAction}
-        blurOnSubmit={false}
         accessibilityLabel={
           parsedOptions.length > 0 ? t("questions.otherPlaceholder") : t("questions.answerPlaceholder")
         }
@@ -673,5 +579,163 @@ export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: Plug
         </Pressable>
       </View>
     </Card>
+  );
+}
+
+export function AskQuestionRow({ agentId, item, theme, layout, timestamp }: PluginTimelineItemProps<AskQuestionCard>) {
+  const { colors } = theme;
+  const paseo = usePaseo();
+  const { callId, questions, output, status: callStatus } = item.data;
+  const cacheKey = `${agentId}:${callId}`;
+
+  const agentState = useAgent(
+    agentId,
+    (agent) => `${agent.provider}|${agent.status}|${agent.lastActivityAt}`,
+  );
+  const [provider = "", agentStatus = "", lastActivityAt = ""] = (agentState ?? "").split("|");
+  const antigravity = !provider || isAntigravityProvider(provider);
+
+  const [trackedKey, setTrackedKey] = useState(cacheKey);
+  const [localResolution, setLocalResolution] = useState<QuestionResolution | null>(
+    () => submittedByKey.get(cacheKey) ?? null,
+  );
+  if (trackedKey !== cacheKey) {
+    setTrackedKey(cacheKey);
+    setLocalResolution(submittedByKey.get(cacheKey) ?? null);
+  }
+
+  const outputResolution = useMemo(() => resolutionFromToolOutput(questions, output), [questions, output]);
+  const echoSignature = useMemo(() => formatQuestionEcho(questions), [questions]);
+
+  const effectiveResolution = trackedKey === cacheKey ? localResolution : (submittedByKey.get(cacheKey) ?? null);
+  const needsTimelineCheck =
+    antigravity &&
+    !effectiveResolution &&
+    !outputResolution &&
+    callStatus !== "failed" &&
+    callStatus !== "canceled";
+
+  const allowStreamingEcho = agentStatus === "running" || callStatus === "running";
+
+  const timelineQuery = useQuery({
+    queryKey: ["antigravity-accounts", "ask-question", agentId],
+    queryFn: () => paseo.agents.ref(agentId).timeline.refetch({ direction: "tail", limit: 40 }),
+    enabled: needsTimelineCheck,
+    placeholderData: (previous) => previous,
+    staleTime: 1000,
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data) return false;
+      const idx = data.entries.findIndex(
+        (entry) => entry.item.type === "tool_call" && entry.item.callId === callId,
+      );
+      if (idx < 0) return data.hasOlder ? false : 3000;
+      for (let cursor = idx + 1; cursor < data.entries.length; cursor += 1) {
+        const next = data.entries[cursor]!.item;
+        if (next.type === "user_message") return false;
+        if (next.type === "assistant_message" && isQuestionEchoMessage(next.text, echoSignature, allowStreamingEcho)) {
+          continue;
+        }
+        if (callStatus !== "running" && (next.type === "tool_call" || next.type === "reasoning" || next.type === "assistant_message")) {
+          return false;
+        }
+      }
+      return agentStatus === "closed" ? false : 3000;
+    },
+  });
+
+  const { refetch: refetchTimeline } = timelineQuery;
+  useEffect(() => {
+    if (needsTimelineCheck && lastActivityAt) {
+      void refetchTimeline();
+    }
+  }, [needsTimelineCheck, lastActivityAt, refetchTimeline]);
+
+  const resolved: QuestionResolution = useMemo(() => {
+    if (effectiveResolution) return effectiveResolution;
+    if (outputResolution) return outputResolution;
+    if (!antigravity) return { state: "settled" };
+    if (callStatus === "failed" || callStatus === "canceled") return { state: "settled" };
+    if (agentStatus === "closed") return { state: "settled" };
+
+    const data = timelineQuery.data;
+    if (!data) {
+      // If the agent already had much later activity, avoid flashing an interactive form while the tail loads.
+      const itemTime = timestamp.getTime();
+      const latestTime = lastActivityAt ? Date.parse(lastActivityAt) : NaN;
+      const hasLaterActivity =
+        Number.isFinite(itemTime) && Number.isFinite(latestTime) && latestTime - itemTime > 12_000;
+      if (hasLaterActivity) {
+        return timelineQuery.isError ? { state: "settled" } : { state: "loading" };
+      }
+      return { state: "pending" };
+    }
+
+    const entries = data.entries;
+    const index = entries.findIndex(
+      (entry) => entry.item.type === "tool_call" && entry.item.callId === callId,
+    );
+    if (index < 0) {
+      return data.hasOlder ? { state: "settled" } : { state: "pending" };
+    }
+
+    for (let cursor = index + 1; cursor < entries.length; cursor += 1) {
+      const next = entries[cursor]!.item;
+      if (next.type === "user_message") {
+        return resolutionFromUserReply(questions, next.text);
+      }
+      if (next.type === "assistant_message" && isQuestionEchoMessage(next.text, echoSignature, allowStreamingEcho)) {
+        continue;
+      }
+      if (callStatus !== "running" && (next.type === "tool_call" || next.type === "reasoning" || next.type === "assistant_message")) {
+        return { state: "settled" };
+      }
+    }
+    return { state: "pending" };
+  }, [
+    effectiveResolution,
+    outputResolution,
+    antigravity,
+    callStatus,
+    agentStatus,
+    allowStreamingEcho,
+    timelineQuery.data,
+    timelineQuery.isError,
+    timestamp,
+    lastActivityAt,
+    callId,
+    questions,
+    echoSignature,
+  ]);
+
+  if (questions.length === 0) return null;
+
+  if (resolved.state === "loading") {
+    return (
+      <Card colors={colors} style={{ paddingVertical: space.sm + 2, paddingHorizontal: space.md, gap: space.xs }}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+          <ActivityIndicator size="small" color={colors.foregroundMuted} />
+          <Text numberOfLines={1} style={{ ...font.small, color: colors.foreground, flex: 1 }}>
+            {questions[0]!.question}
+          </Text>
+        </View>
+      </Card>
+    );
+  }
+
+  if (resolved.state !== "pending") {
+    return <SettledQuestionCard colors={colors} questions={questions} resolution={resolved} />;
+  }
+
+  return (
+    <PendingQuestionForm
+      key={cacheKey}
+      agentId={agentId}
+      cacheKey={cacheKey}
+      colors={colors}
+      layout={layout}
+      questions={questions}
+      onResolved={setLocalResolution}
+    />
   );
 }

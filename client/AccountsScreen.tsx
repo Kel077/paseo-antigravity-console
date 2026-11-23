@@ -1,7 +1,7 @@
 import { useRpc, useTranslation, type PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, SettingsCard, SettingsRow, SettingsSelect, SettingsSwitch, useToast } from "@getpaseo/plugin/client/ui";
-import { useEffect, useState, useSyncExternalStore } from "react";
-import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
 import {
   clearCooldownRpc,
   createAccountRpc,
@@ -20,7 +20,7 @@ import { AccountCard, type CardAction } from "./AccountCard";
 import type { AgentObservation } from "./agents";
 import { AccountAgentsDialog, ConfirmRemove, NameDialog, RecoverFilesDialog } from "./dialogs";
 import { displayLabel } from "./labels";
-import { antigravityLogo } from "./logo";
+import { antigravityLogoSvg } from "./logo";
 import { errorMessage, messages } from "./messages";
 import { AccountOrchestratorDialog, OrchestratorRows } from "./orchestrator";
 import { SignIn } from "./signIn";
@@ -52,7 +52,7 @@ function AddAccountCard({ colors, onAdd }: { colors: Colors; onAdd(): void }) {
   return (
     <View
       style={{
-        flex: 1,
+        flexGrow: 1,
         minHeight: 160,
         borderWidth: 1,
         borderStyle: "dashed",
@@ -105,11 +105,33 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [now, setNow] = useState(Date.now);
   const [width, setWidth] = useState(0);
+  const dialogTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 30_000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      if (dialogTimerRef.current) clearTimeout(dialogTimerRef.current);
+    };
   }, []);
+
+  const compact = layout.compact || (width > 0 && width < 560);
+  const useModalMenu = compact || Platform.OS !== "web";
+
+  function openDialog(next: Dialog, fromClosingModal = false) {
+    if (dialogTimerRef.current) {
+      clearTimeout(dialogTimerRef.current);
+      dialogTimerRef.current = null;
+    }
+    if (fromClosingModal && Platform.OS !== "web") {
+      dialogTimerRef.current = setTimeout(() => {
+        dialogTimerRef.current = null;
+        setDialog(next);
+      }, 180);
+      return;
+    }
+    setDialog(next);
+  }
 
   async function track(accountId: string, action: CardAction, task: () => Promise<void>) {
     setBusy((current) => ({ ...current, [accountId]: action }));
@@ -123,6 +145,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
   }
 
   function onAction(account: AccountSummary, action: CardAction) {
+    const wasModalMenuOpen = Boolean(openMenuId) && useModalMenu;
     setOpenMenuId(null);
     const input = { accountId: account.id };
     switch (action) {
@@ -156,21 +179,20 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
           accept(await signOut(input));
         });
       case "rename":
-        return setDialog({ kind: "rename", account });
+        return openDialog({ kind: "rename", account }, wasModalMenuOpen);
       case "remove":
-        return setDialog({ kind: "remove", account });
+        return openDialog({ kind: "remove", account }, wasModalMenuOpen);
       case "signIn":
-        return setDialog({ kind: "signIn", account });
+        return openDialog({ kind: "signIn", account }, wasModalMenuOpen);
       case "recoverFiles":
-        return setDialog({ kind: "recoverFiles", account });
+        return openDialog({ kind: "recoverFiles", account }, wasModalMenuOpen);
       case "manageAgents":
-        return setDialog({ kind: "manageAgents", account });
+        return openDialog({ kind: "manageAgents", account }, wasModalMenuOpen);
       case "orchestratorOverride":
-        return setDialog({ kind: "orchestratorOverride", account });
+        return openDialog({ kind: "orchestratorOverride", account }, wasModalMenuOpen);
     }
   }
 
-  const compact = layout.compact || (width > 0 && width < 560);
   const padding = compact ? space.lg : space.xxl;
   const gap = compact ? space.md : space.lg;
   const contentWidth = Math.min(Math.max(width - padding * 2, 0), 980);
@@ -186,7 +208,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
   return (
     <View style={{ flex: 1, backgroundColor: colors.surface0 }} onLayout={(event) => setWidth(event.nativeEvent.layout.width)}>
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding, alignItems: "center" }}>
-        {openMenuId ? (
+        {openMenuId && !useModalMenu ? (
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={t("dialog.close")}
@@ -194,10 +216,14 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
             style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, zIndex: 15 }}
           />
         ) : null}
-        <View style={{ width: contentWidth || "100%", maxWidth: 980, gap: space.xxxl }}>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: space.lg }}>
-            <Avatar colors={colors} label="A" logo={antigravityLogo} size={compact ? 40 : 48} />
-            <Text accessibilityRole="header" numberOfLines={1} style={{ ...font.title, color: colors.foreground, flex: 1 }}>
+        <View style={{ width: contentWidth || "100%", maxWidth: 980, gap: compact ? space.xxl : space.xxxl }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: compact ? space.md : space.lg }}>
+            <Avatar colors={colors} label="A" logo={antigravityLogoSvg("header")} size={compact ? 38 : 48} />
+            <Text
+              accessibilityRole="header"
+              numberOfLines={1}
+              style={{ ...font.title, fontSize: compact ? 19 : font.title.fontSize, color: colors.foreground, flex: 1 }}
+            >
               {t("title")}
             </Text>
             <Button
@@ -383,7 +409,12 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
           onSubmit={async (label) => {
             const result = await create({ label });
             accept(result.state);
-            setDialog({ kind: "signIn", account: result.account });
+            if (Platform.OS !== "web") {
+              setDialog(null);
+              openDialog({ kind: "signIn", account: result.account }, true);
+            } else {
+              setDialog({ kind: "signIn", account: result.account });
+            }
           }}
         />
       ) : null}

@@ -11,7 +11,7 @@ import {
   type UsageStats,
   type UsageTotals,
 } from "../shared/contracts";
-import { integer, percent, tokens, usd, usdShort } from "./format";
+import { clockTime, integer, monthDay, percent, tokens, usd, usdShort } from "./format";
 import { displayLabel } from "./labels";
 import { messages } from "./messages";
 import { PricingDialog } from "./pricing";
@@ -211,20 +211,18 @@ function StatTile({
 }
 
 function binLabel(start: number, end: number, binMs: number, locale: string): string {
-  const date = new Date(start);
-  const time = new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
-  const day = new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric" }).format(date);
+  const day = monthDay(start, locale);
   if (binMs >= 86_400_000) return day;
-  const endText = new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(end));
+  const time = clockTime(start, locale);
+  const endText = clockTime(end, locale);
   return `${day} ${time}–${endText}`;
 }
 
 function tickLabel(start: number, binMs: number, locale: string): string {
-  const date = new Date(start);
   if (binMs >= 86_400_000 || binMs >= 6 * 3_600_000) {
-    return new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric" }).format(date);
+    return monthDay(start, locale);
   }
-  return new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+  return clockTime(start, locale);
 }
 
 function showsTick(start: number, binMs: number, index: number, total: number): boolean {
@@ -300,7 +298,16 @@ function MetricChart({
   return (
     <Card colors={colors} style={{ padding: space.lg, gap: space.md }}>
       <View style={{ flexDirection: compact ? "column" : "row", alignItems: compact ? "flex-start" : "center", gap: space.sm }}>
-        <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, flex: compact ? undefined : 1, minWidth: 0 }}>
+        <View
+          style={{
+            flexDirection: "row",
+            alignItems: "baseline",
+            gap: space.sm,
+            flex: compact ? undefined : 1,
+            alignSelf: compact ? "stretch" : undefined,
+            minWidth: 0,
+          }}
+        >
           <Text style={{ ...font.heading, color: colors.foreground }}>{t(periodKey)}</Text>
           <Text numberOfLines={compact ? 2 : 1} style={{ ...font.small, color: colors.foregroundMuted, flexShrink: 1 }}>
             {bin ? `${binLabel(bin.start, bin.end, stats.binMs, locale)}  ` : ""}
@@ -527,9 +534,27 @@ function ModelTable({
               <>
                 <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
                   {name}
-                  <Text style={{ ...font.small, ...tabular, fontWeight: "600", color: colors.foreground }}>
-                    {values.cost}
-                  </Text>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={t("pricing.editFor", { model: model.label })}
+                    hitSlop={8}
+                    onPress={(event) => {
+                      event.stopPropagation?.();
+                      onEditPricing(model.pricingKey);
+                    }}
+                    style={{ minHeight: 28, justifyContent: "center", paddingHorizontal: 6 }}
+                  >
+                    <Text
+                      style={{
+                        ...font.small,
+                        ...tabular,
+                        fontWeight: "600",
+                        color: figures.cost === null ? colors.statusWarning : colors.foreground,
+                      }}
+                    >
+                      {values.cost}
+                    </Text>
+                  </Pressable>
                   <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
                     {t("stats.readoutRequests", { count: model.requests })}
                   </Text>
@@ -634,7 +659,7 @@ export function UsageSection({
         />
       </View>
 
-      {accountChips.length > 1 || selectedModel ? (
+      {accountChips.length > 1 || accountId !== null || selectedModel ? (
         <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.xs }}>
           {accountChips.length > 1 ? (
             <>
@@ -683,6 +708,31 @@ export function UsageSection({
                 );
               })}
             </>
+          ) : accountId !== null ? (
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => {
+                setAccountId(null);
+                setSelectedModel(null);
+              }}
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 4,
+                paddingHorizontal: space.sm + 2,
+                height: 26,
+                borderRadius: radius.pill,
+                backgroundColor: tint(colors.accent, 0.16),
+              }}
+            >
+              <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
+                {(() => {
+                  const matched = accounts.find((entry) => entry.id === accountId);
+                  return matched ? displayLabel(matched.label, t, matched.kind) : accountId;
+                })()}
+              </Text>
+              <Icon name="X" size={12} color={colors.accent} />
+            </Pressable>
           ) : null}
 
           {selectedModel ? (

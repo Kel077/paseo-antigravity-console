@@ -3,7 +3,7 @@ import { Icon } from "@getpaseo/plugin/client/ui";
 import { Pressable, Text, View } from "react-native";
 import type { QuotaBucket, QuotaGroup } from "../shared/contracts";
 import { percent } from "./format";
-import { antigravityLogo } from "./logo";
+import { antigravityLogoSvg } from "./logo";
 import { messages } from "./messages";
 import { remainingTone, tabular, tint, type Colors } from "./theme";
 import { Bar } from "./ui";
@@ -81,7 +81,7 @@ export function QuotaSidebarItem({ theme, currentScreen, openScreen }: PluginSid
             : "transparent",
       })}
     >
-      <Icon icon={{ svg: antigravityLogo }} size={ICON_SIZE} color={colors.foregroundMuted} />
+      <Icon icon={{ svg: antigravityLogoSvg("sidebar") }} size={ICON_SIZE} color={colors.foregroundMuted} />
       <Meter colors={colors} label="5H" bucket={fiveHour} locale={locale} />
       <Meter colors={colors} label="7D" bucket={weekly} locale={locale} />
     </Pressable>

@@ -10,7 +10,7 @@ import { useSyncExternalStore } from "react";
 import { AccountsScreen } from "./client/AccountsScreen";
 import { observeAgents } from "./client/agents";
 import { ComposerAccount } from "./client/composer";
-import { antigravityLogo } from "./client/logo";
+import { antigravityLogoSvg } from "./client/logo";
 import { errorMessage, messages } from "./client/messages";
 import { QuotaSidebarItem } from "./client/sidebar";
 import { SUBAGENT_PANEL_ID, createSubagentViews } from "./client/subagents";
@@ -29,7 +29,8 @@ import {
   subagentCheckSchema,
 } from "./shared/contracts";
 
-const logo = { svg: antigravityLogo };
+const settingsLogo = { svg: antigravityLogoSvg("settings") };
+const commandLogo = { svg: antigravityLogoSvg("command") };
 
 export default function contribute(client: PluginClientContext) {
   const subagents = createSubagentViews(client);
@@ -58,7 +59,7 @@ export default function contribute(client: PluginClientContext) {
 
   const cleanup = [
     client.addScreen({ id: "accounts", title, Component: Screen }),
-    client.addSettingsScreen({ id: "accounts", title, icon: logo, Component: Screen }),
+    client.addSettingsScreen({ id: "accounts", title, icon: settingsLogo, Component: Screen }),
     client.addSidebarFooterItem({ id: "accounts", title, Component: Sidebar }),
     client.addWorkspaceRowBadgeItem({
       id: "running-subagents",
@@ -69,7 +70,7 @@ export default function contribute(client: PluginClientContext) {
     client.addCommandCenterItem({
       id: "accounts",
       title,
-      icon: logo,
+      icon: commandLogo,
       context: "global",
       onSelect: ({ openScreen }) => openScreen({ screenId: "accounts" }),
     }),

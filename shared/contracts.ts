@@ -727,6 +727,7 @@ export const ASK_QUESTION_TIMELINE_KIND = "antigravity-ask-question";
 
 export const subagentCardSchema = z.object({
   id: z.string(),
+  role: z.string().nullable().optional(),
   type: z.string().nullable(),
   task: z.string(),
   status: z.enum(["running", "completed", "failed", "canceled"]),

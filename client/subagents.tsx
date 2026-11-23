@@ -23,7 +23,7 @@ import {
   type TranscriptEntry,
 } from "../shared/contracts";
 import { estimateRequestCost, resolveEffectiveRates, resolvePricingKey, type ModelRates } from "../shared/pricing";
-import { tokens, usd } from "./format";
+import { clockTime, duration, tokens, upper, usd } from "./format";
 import { errorMessage, messages } from "./messages";
 import { usePricing } from "./pricing";
 import { font, mono, radius, space, tabular, tint, toneColor, type Colors, type Tone } from "./theme";
@@ -86,23 +86,12 @@ function toolIcon(name: string): string {
 }
 
 function since(start: string | null, end: string | null, locale: string): string | null {
-  const from = start ? Date.parse(start) : NaN;
-  const to = end ? Date.parse(end) : NaN;
-  if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) return null;
-  const seconds = Math.round((to - from) / 1000);
-  const format = (value: number, unit: "second" | "minute" | "hour") =>
-    new Intl.NumberFormat(locale, { style: "unit", unit, unitDisplay: "narrow" }).format(value);
-  if (seconds < 60) return format(Math.max(1, seconds), "second");
-  if (seconds < 3600) return format(Math.round(seconds / 60), "minute");
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.round((seconds % 3600) / 60);
-  return minutes ? `${format(hours, "hour")} ${format(minutes, "minute")}` : format(hours, "hour");
+  return duration(start, end, locale);
 }
 
 function clock(at: string | null, locale: string): string {
-  const time = at ? Date.parse(at) : NaN;
-  if (!Number.isFinite(time)) return "";
-  return new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(time);
+  if (!at) return "";
+  return clockTime(at, locale, true);
 }
 
 function formatBytes(bytes: number): string {
@@ -258,16 +247,36 @@ export function createSubagentViews(client: PluginClientContext) {
     const overrides = pricing.data?.overrides ?? {};
     const workspaceId = useAgent(agentId, (agent) => agent.workspaceId);
     const card = item.data;
-    const summary = query.data?.subagents.find((subagent) => subagent.id === card.id);
+    const summary = useMemo(() => {
+      const subagents = query.data?.subagents;
+      if (!subagents?.length) return undefined;
+      if (card.id) {
+        const byId = subagents.find((subagent) => subagent.id === card.id);
+        if (byId) return byId;
+      }
+      const taskPrefix = card.task.replace(/…$/, "").trim().slice(0, 80);
+      return subagents.find((subagent) => {
+        if (card.role && subagent.role && subagent.role !== card.role) return false;
+        if (card.type && subagent.type && subagent.type !== card.type) return false;
+        if (!taskPrefix) return Boolean(card.role && subagent.role === card.role);
+        const candidateTask = subagent.task.trim();
+        return (
+          candidateTask.startsWith(taskPrefix) ||
+          (candidateTask.length > 0 && taskPrefix.startsWith(candidateTask.slice(0, 80)))
+        );
+      });
+    }, [query.data?.subagents, card.id, card.role, card.type, card.task]);
     const state = shownState(summary, card.status);
     const activity = activityLine(summary, t);
     const thinking = summary?.state === "running" && summary.phase === "thinking";
-    const title = summary?.role ?? card.type ?? t("subagents.title");
+    const resolvedRole = summary?.role ?? card.role ?? null;
+    const title = resolvedRole ?? card.type ?? t("subagents.title");
+    const targetId = summary?.id || card.id || undefined;
     return (
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`${title} · ${t(`subagents.state.${state}`)}`}
-        onPress={() => open(agentId, workspaceId, card.id || undefined)}
+        onPress={() => open(agentId, workspaceId, targetId)}
         style={(pressState) => ({
           flexDirection: "row",
           gap: space.md,
@@ -297,7 +306,7 @@ export function createSubagentViews(client: PluginClientContext) {
             <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: colors.foreground, flexShrink: 1 }}>
               {title}
             </Text>
-            {card.type && summary?.role ? (
+            {card.type && resolvedRole ? (
               <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
                 {card.type}
               </Text>
@@ -1066,7 +1075,7 @@ function Section({
   return (
     <View style={{ gap: space.sm }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-        <Text style={{ ...font.overline, color: colors.foregroundMuted }}>{title.toLocaleUpperCase()}</Text>
+        <Text style={{ ...font.overline, color: colors.foregroundMuted }}>{upper(title)}</Text>
         <View style={{ flex: 1 }} />
         {trailing}
       </View>

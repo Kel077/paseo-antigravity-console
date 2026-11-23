@@ -2,7 +2,7 @@ import { useTranslation, type PluginButtonContentProps } from "@getpaseo/plugin/
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { Text, View } from "react-native";
 import type { ContextUsage } from "../shared/contracts";
-import { integer, percent, relative, tokens } from "./format";
+import { integer, percent, relative, tokens, upper } from "./format";
 import { messages } from "./messages";
 import { font, space, tabular, tint, toneColor, usedTone } from "./theme";
 import { Bar } from "./ui";
@@ -100,7 +100,7 @@ export function ContextPopover(props: PluginButtonContentProps) {
   return (
     <View style={{ width: props.layout.compact ? "100%" : 320, gap: space.lg }}>
       <View style={{ gap: space.xs }}>
-        <Text style={{ ...font.overline, color: colors.foregroundMuted }}>{t("context.title").toLocaleUpperCase(locale)}</Text>
+        <Text style={{ ...font.overline, color: colors.foregroundMuted }}>{upper(t("context.title"), locale)}</Text>
         <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
           <Text style={{ fontSize: 26, lineHeight: 32, fontWeight: "600", ...tabular, color: colors.foreground }}>
             {tokens(usage.used)}

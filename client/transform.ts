@@ -15,12 +15,23 @@ import {
 } from "./questionModel";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_ANYWHERE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 /** agy logs live under `<home>/.gemini/antigravity-cli/brain/<conversation>/`. */
 const AGY_LOG = /[/\\]brain[/\\][0-9a-f-]{36}[/\\]/i;
 const MAX_ECHO_CACHE = 200;
 
 function cut(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function extractChildId(output: unknown): string {
+  const text = extractToolOutput(output);
+  if (text) return UUID_ANYWHERE.exec(text)?.[0] ?? "";
+  if (output && typeof output === "object") {
+    const id = (output as { conversationId?: unknown }).conversationId;
+    if (typeof id === "string" && UUID.test(id)) return id;
+  }
+  return "";
 }
 
 /** The JSON list `manage_subagents` prints after "You have N active subagent(s):". */
@@ -110,6 +121,23 @@ export function registerSubagentTransforms(client: PluginClientContext) {
           id: childId,
           type: detail.subAgentType ?? null,
           task: cut((detail.description ?? "").trim(), 600),
+          status,
+        };
+        return { items: [{ type: "plugin", kind: SUBAGENT_TIMELINE_KIND, version: 1, data }] };
+      }
+      // Paseo 0.17+ runs Antigravity over generic ACP where `invoke_subagent` arrives as `unknown` with `{ Prompt, Role, TypeName }`.
+      if (item.name === "invoke_subagent" && item.detail.type === "unknown") {
+        const input = item.detail.input as { Prompt?: unknown; Role?: unknown; TypeName?: unknown } | null;
+        if (!input || typeof input !== "object") return undefined;
+        const prompt = typeof input.Prompt === "string" ? input.Prompt.trim() : "";
+        const role = typeof input.Role === "string" && input.Role.trim() ? input.Role.trim() : null;
+        const typeName = typeof input.TypeName === "string" && input.TypeName.trim() ? input.TypeName.trim() : null;
+        if (!prompt && !role && !typeName) return undefined;
+        const data: SubagentCard = {
+          id: extractChildId(item.detail.output),
+          role,
+          type: typeName,
+          task: cut(prompt, 600),
           status,
         };
         return { items: [{ type: "plugin", kind: SUBAGENT_TIMELINE_KIND, version: 1, data }] };

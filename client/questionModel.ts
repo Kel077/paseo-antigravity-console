@@ -109,7 +109,13 @@ export function resolutionFromToolOutput(
   // When agy answered in chat mode for multiple questions, every entry received the same WriteInResponse.
   const allSame = values.length > 1 && values.every((value) => value === values[0]);
   if (allSame && values[0]) {
-    return resolutionFromUserReply(questions, values[0]);
+    const parsed = resolutionFromUserReply(questions, values[0]);
+    if (
+      parsed.state === "skipped" ||
+      (parsed.state === "answered" && parsed.perQuestion.some((answer) => answer !== null))
+    ) {
+      return parsed;
+    }
   }
   return {
     state: "answered",

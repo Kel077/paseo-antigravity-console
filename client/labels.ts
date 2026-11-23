@@ -1,4 +1,5 @@
 import type { AccountSummary } from "../shared/contracts";
+import { safeLocale } from "./format";
 
 /** The server's default name for the system sign-in; shown translated until the user renames it. */
 export const DEFAULT_SYSTEM_LABEL = "System sign-in";
@@ -16,10 +17,22 @@ export function displayLabel(
 export function joinList(items: readonly string[], locale: string): string {
   if (items.length <= 1) return items[0] ?? "";
   try {
-    const ListFormat = (Intl as { ListFormat?: new (locale: string, options: { style: string; type: string }) => { format(list: readonly string[]): string } }).ListFormat;
-    if (ListFormat) return new ListFormat(locale, { style: "narrow", type: "conjunction" }).format(items);
+    const ListFormat =
+      typeof Intl !== "undefined"
+        ? (
+            Intl as {
+              ListFormat?: new (
+                locale: string,
+                options: { style: string; type: string },
+              ) => { format(list: readonly string[]): string };
+            }
+          ).ListFormat
+        : undefined;
+    if (typeof ListFormat === "function") {
+      return new ListFormat(safeLocale(locale), { style: "narrow", type: "conjunction" }).format(items);
+    }
   } catch {
     // Fallback below.
   }
-  return items.join(locale.toLowerCase().startsWith("zh") ? "、" : ", ");
+  return items.join(safeLocale(locale).toLowerCase().startsWith("zh") ? "、" : ", ");
 }

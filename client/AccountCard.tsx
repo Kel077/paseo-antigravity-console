@@ -1,10 +1,10 @@
 import { useTranslation } from "@getpaseo/plugin/client";
-import { Icon } from "@getpaseo/plugin/client/ui";
-import { Pressable, Text, View } from "react-native";
+import { Icon, Modal } from "@getpaseo/plugin/client/ui";
+import { Platform, Pressable, Text, View } from "react-native";
 import type { AccountSummary, QuotaBucket, QuotaGroup } from "../shared/contracts";
-import { percent, relative } from "./format";
+import { percent, relative, upper } from "./format";
 import { displayLabel } from "./labels";
-import { antigravityLogo } from "./logo";
+import { antigravityLogoSvg } from "./logo";
 import { messages } from "./messages";
 import { font, radius, remainingTone, space, tabular, tint, toneColor, type Colors, type Tone } from "./theme";
 import { Avatar, Badge, Bar, Button, Callout, Card, Divider, hueFor, IconButton, Muted } from "./ui";
@@ -118,7 +118,7 @@ function QuotaGroupView({
   return (
     <View style={{ gap: space.sm }}>
       <Text numberOfLines={1} style={{ ...font.overline, color: colors.foregroundMuted }}>
-        {group.name.toLocaleUpperCase(locale)}
+        {upper(group.name, locale)}
       </Text>
       {rows.map(([left, right]) => (
         <View key={left.id} style={{ flexDirection: "row", gap: compact ? space.lg : space.xl }}>
@@ -132,13 +132,50 @@ function QuotaGroupView({
 
 function Menu({
   colors,
+  title,
+  useModal,
   items,
+  onClose,
   onSelect,
 }: {
   colors: Colors;
+  title: string;
+  useModal: boolean;
   items: Array<{ id: CardAction; label: string; icon: string; danger?: boolean }>;
+  onClose(): void;
   onSelect(action: CardAction): void;
 }) {
+  if (useModal) {
+    return (
+      <Modal open title={title} onOpenChange={(open) => { if (!open) onClose(); }}>
+        <Modal.Content>
+          <View style={{ gap: 2 }}>
+            {items.map((item) => (
+              <Pressable
+                key={item.id}
+                accessibilityRole="menuitem"
+                onPress={() => onSelect(item.id)}
+                style={(state) => ({
+                  flexDirection: "row",
+                  alignItems: "center",
+                  gap: space.md,
+                  paddingHorizontal: space.md,
+                  minHeight: 42,
+                  borderRadius: radius.md,
+                  backgroundColor: state.pressed ? tint(colors.foreground, 0.08) : "transparent",
+                })}
+              >
+                <Icon name={item.icon} size={17} color={item.danger ? colors.statusDanger : colors.foregroundMuted} />
+                <Text style={{ ...font.body, color: item.danger ? colors.statusDanger : colors.foreground, flex: 1 }}>
+                  {item.label}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        </Modal.Content>
+      </Modal>
+    );
+  }
   return (
     <Card
       colors={colors}
@@ -230,11 +267,17 @@ export function AccountCard({
     menuItems.push({ id: "remove", label: t("action.remove"), icon: "Trash2", danger: true });
   }
 
+  const useModalMenu = compact || Platform.OS !== "web";
   return (
-    <Card colors={colors} style={{ flex: 1, zIndex: menuOpen ? 30 : 0, overflow: "visible" }}>
-      <View style={{ flex: 1, padding: space.lg, gap: space.md }}>
+    <Card colors={colors} style={{ flexGrow: 1, zIndex: menuOpen && !useModalMenu ? 30 : 0, overflow: "visible" }}>
+      <View style={{ flexGrow: 1, padding: space.lg, gap: space.md }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.md }}>
-          <Avatar colors={colors} label={name} logo={isProfile ? undefined : antigravityLogo} hue={isProfile ? hueFor(account.id) : undefined} />
+          <Avatar
+            colors={colors}
+            label={name}
+            logo={isProfile ? undefined : antigravityLogoSvg(`card-${account.id}`)}
+            hue={isProfile ? hueFor(account.id) : undefined}
+          />
           <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, height: 24 }}>
               <Text numberOfLines={1} style={{ ...font.heading, color: colors.foreground, flexShrink: 1 }}>
@@ -360,7 +403,16 @@ export function AccountCard({
           />
         </View>
       </View>
-      {menuOpen ? <Menu colors={colors} items={menuItems} onSelect={onAction} /> : null}
+      {menuOpen ? (
+        <Menu
+          colors={colors}
+          title={name}
+          useModal={useModalMenu}
+          items={menuItems}
+          onClose={onToggleMenu}
+          onSelect={onAction}
+        />
+      ) : null}
     </Card>
   );
 }

@@ -1,6 +1,7 @@
 import { Icon } from "@getpaseo/plugin/client/ui";
 import type { ReactNode } from "react";
 import { ActivityIndicator, Pressable, Text, View, type StyleProp, type ViewStyle } from "react-native";
+import { upper } from "./format";
 import { font, radius, space, tint, toneColor, type Colors, type Tone } from "./theme";
 
 type PressState = { pressed: boolean; hovered?: boolean };
@@ -167,7 +168,7 @@ export function Badge({
 /** First visible character of a label (handles CJK and emoji). */
 function initial(label: string): string {
   const first = Array.from(label.trim())[0] ?? "?";
-  return first.toLocaleUpperCase();
+  return upper(first);
 }
 
 /** A stable, readable hue per account so accounts are easy to tell apart. */
