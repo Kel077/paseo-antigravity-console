@@ -6,6 +6,7 @@ A [Paseo](https://paseo.sh) plugin for the built-in Antigravity provider:
 - **Model-aware automatic fallback.** Failed turns are retried, then continued on the next eligible account that supports the model and has quota in the right pool (Gemini vs Claude/GPT), using priority order, highest remaining quota, or soonest reset. View and clear cooldowns directly on account cards.
 - **Quota, usage, and estimated cost.** The Google AI plan, 5-hour and weekly quota of every account, per-request API cost estimates based on official Google rates (with customizable per-model pricing), plus switchable usage charts (requests, cost, tokens, speed, cache hit rate, first-token latency), main vs subagent breakdown, model filtering, and per-account attribution.
 - **Subagents.** Live timeline cards, workspace running badges, and a searchable Subagents panel with task, artifacts preview, filterable activity log with auto-scroll, transcript export, and one-click report insertion into the parent composer.
+- **Interactive questions.** Turns `ask_question` tool calls into interactive choice cards (single-select, multi-select, multi-question navigation, custom text input, and skip) and hides the duplicate plain-text list emitted by `agy acp`.
 - **Orchestrator models.** Choose the Orchestrator's planner and executor globally (with quick presets), per profile account, from the composer pill, or via `/orchestrator`.
 - **Context.** A composer pill with the agent's context window use.
 

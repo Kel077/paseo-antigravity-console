@@ -393,5 +393,23 @@
     "slashHint": "[default|quality|balanced|planner <name>|executor <name>]",
     "slashCurrent": "Orchestrator — Planner: {{planner}} · Executor: {{executor}}",
     "slashNoMatch": "No matching Orchestrator model or preset."
+  },
+  "questions": {
+    "heading": "Question",
+    "title_one": "Asked {{count}} question",
+    "title_other": "Asked {{count}} questions",
+    "tab": "Q{{index}}",
+    "stepLabel": "Question {{current}} of {{total}}",
+    "multiSelect": "Select multiple",
+    "recommended": "Recommended",
+    "otherPlaceholder": "Other (type your own answer)…",
+    "answerPlaceholder": "Type your answer…",
+    "next": "Next",
+    "submit": "Submit",
+    "skip": "Skip",
+    "editInComposer": "Edit in composer",
+    "insertedComposer": "Answer inserted into composer",
+    "answered": "Answered",
+    "skipped": "Skipped"
   }
 }

@@ -380,5 +380,22 @@
     "slashHint": "[default|quality|balanced|planner <名称>|executor <名称>]",
     "slashCurrent": "Orchestrator — Planner：{{planner}} · Executor：{{executor}}",
     "slashNoMatch": "没有匹配的 Orchestrator 模型或预设。"
+  },
+  "questions": {
+    "heading": "请确认选项",
+    "title_other": "提出了 {{count}} 个问题",
+    "tab": "问题 {{index}}",
+    "stepLabel": "问题 {{current}} / {{total}}",
+    "multiSelect": "可多选",
+    "recommended": "推荐",
+    "otherPlaceholder": "其他回答（直接输入）…",
+    "answerPlaceholder": "输入你的回答…",
+    "next": "下一题",
+    "submit": "提交回答",
+    "skip": "跳过",
+    "editInComposer": "填入输入框",
+    "insertedComposer": "已将回答填入输入框",
+    "answered": "已回答",
+    "skipped": "已跳过"
   }
 }

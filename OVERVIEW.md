@@ -9,6 +9,7 @@ More than one Google account for Paseo's built-in Antigravity provider, with aut
 - **Quota.** Each account's Google AI plan, such as Google AI Pro, and its 5-hour and weekly quota. The sidebar footer shows the default account's two meters. In Paseo's Usage, Paseo itself reports the system sign-in and the account each agent runs on; the plugin adds the accounts you added, with their plan.
 - **Usage and cost.** Estimated API cost per request (using official Google AI Studio rates, with editable custom prices per model), requests, tokens, output speed, cache hit rate, and time to first token over 24 hours, 7 days, or 30 days, with switchable chart metrics, model filtering, main-versus-subagent split, and per-account attribution.
 - **Subagents.** The subagents Antigravity starts show as live cards in the agent's timeline, a workspace badge while running, and a Subagents panel with search and state filters, each subagent's task, steps, artifacts, token use, full transcript copy, and one-click insertion of its report into the parent composer.
+- **Interactive questions.** Renders Antigravity's `ask_question` calls as interactive choice cards with single-select, multi-select, multi-question tabs, free-text answers, and skip, replacing the raw JSON block and hiding the duplicate plain-text list from the CLI.
 - **Orchestrator.** Choose the planner and executor models of Antigravity's Orchestrator and their effort globally, via quick presets, per profile account, from a composer pill on Orchestrator agents, or with `/orchestrator`. Global choices are saved where the CLI's own `/model` saves them.
 - **Context.** A composer pill with the agent's context window use.
 
@@ -25,6 +26,7 @@ To add an account, open Antigravity Console from the Command Center or the sideb
 - Before each launch on an added account, the plugin atomically copies agy's `settings.json` into that account's profile and merges any per-account Orchestrator override, so every account uses the same base preferences.
 - Choosing a global planner or executor writes the `orchestrator` entry of `~/.gemini/antigravity-cli/settings.json`.
 - Quota, plans, model lists, and sign-in run the agy CLI on the daemon host. Usage, context, and subagent views read agy's conversation records, artifacts, and logs under `~/.gemini/antigravity-cli`.
+- Submitting or skipping an interactive question card sends your answer (or "User Skipped") as a message to that Antigravity agent through Paseo.
 - The plugin makes no network requests of its own and sends no data anywhere; agy talks to Google as it always does. It never reads the keychain. The account list, status cache, custom price overrides, and conversation-to-account attribution map are kept in Paseo's plugin data folder.
 
 ## Limits

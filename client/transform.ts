@@ -1,14 +1,23 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import {
+  ASK_QUESTION_TIMELINE_KIND,
   SUBAGENT_LIST_TIMELINE_KIND,
   SUBAGENT_TIMELINE_KIND,
+  type AskQuestionCard,
   type SubagentCard,
   type SubagentCheck,
 } from "../shared/contracts";
+import {
+  extractToolOutput,
+  formatQuestionEcho,
+  normalizeEchoText,
+  parseAskQuestions,
+} from "./questionModel";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** agy logs live under `<home>/.gemini/antigravity-cli/brain/<conversation>/`. */
 const AGY_LOG = /[/\\]brain[/\\][0-9a-f-]{36}[/\\]/i;
+const MAX_ECHO_CACHE = 200;
 
 function cut(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
@@ -69,11 +78,25 @@ function killedStates(input: unknown, output: unknown): SubagentCheck["states"] 
 }
 
 /**
- * Antigravity's own subagent rows: `invoke_subagent` becomes a live card of the child it started,
- * and `manage_subagents` becomes a one-line summary.
+ * Antigravity's own timeline rows:
+ * - `invoke_subagent` becomes a live card of the child it started;
+ * - `manage_subagents` becomes a one-line summary;
+ * - `ask_question` becomes an interactive question card (and hides agy's duplicate plain-text list).
  */
 export function registerSubagentTransforms(client: PluginClientContext) {
-  return client.addTimelineTransformer({
+  const knownQuestionEchoes = new Set<string>();
+
+  function rememberEcho(signature: string) {
+    if (!signature) return;
+    knownQuestionEchoes.delete(signature);
+    knownQuestionEchoes.add(signature);
+    if (knownQuestionEchoes.size > MAX_ECHO_CACHE) {
+      const oldest = knownQuestionEchoes.keys().next().value;
+      if (oldest) knownQuestionEchoes.delete(oldest);
+    }
+  }
+
+  const removeToolTransform = client.addTimelineTransformer({
     id: "antigravity-subagents",
     query: { itemType: "tool_call" },
     transform({ item }) {
@@ -102,7 +125,40 @@ export function registerSubagentTransforms(client: PluginClientContext) {
         const data: SubagentCheck = { action, states, status };
         return { items: [{ type: "plugin", kind: SUBAGENT_LIST_TIMELINE_KIND, version: 1, data }] };
       }
+      if (item.name === "ask_question" && item.detail.type === "unknown") {
+        const questions = parseAskQuestions(item.detail.input);
+        if (!questions) return undefined;
+        if (questions.some((entry) => entry.options.length > 0)) {
+          rememberEcho(formatQuestionEcho(questions));
+        }
+        const data: AskQuestionCard = {
+          callId: item.callId,
+          questions,
+          output: extractToolOutput(item.detail.output),
+          status,
+        };
+        return { items: [{ type: "plugin", kind: ASK_QUESTION_TIMELINE_KIND, version: 1, data }] };
+      }
       return undefined;
     },
   });
+
+  const removeEchoTransform = client.addTimelineTransformer({
+    id: "antigravity-ask-question-echo",
+    query: { itemType: "assistant_message" },
+    transform({ item }) {
+      if (knownQuestionEchoes.size === 0) return undefined;
+      const normalized = normalizeEchoText(item.text);
+      if (normalized && knownQuestionEchoes.has(normalized)) {
+        return { items: [] };
+      }
+      return undefined;
+    },
+  });
+
+  return () => {
+    removeToolTransform();
+    removeEchoTransform();
+    knownQuestionEchoes.clear();
+  };
 }

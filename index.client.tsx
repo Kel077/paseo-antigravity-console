@@ -14,12 +14,15 @@ import { antigravityLogo } from "./client/logo";
 import { errorMessage, messages } from "./client/messages";
 import { QuotaSidebarItem } from "./client/sidebar";
 import { SUBAGENT_PANEL_ID, createSubagentViews } from "./client/subagents";
+import { AskQuestionRow } from "./client/questions";
 import { FallbackNote } from "./client/timeline";
 import { registerSubagentTransforms } from "./client/transform";
 import {
+  ASK_QUESTION_TIMELINE_KIND,
   FALLBACK_TIMELINE_KIND,
   SUBAGENT_LIST_TIMELINE_KIND,
   SUBAGENT_TIMELINE_KIND,
+  askQuestionCardSchema,
   fallbackEventSchema,
   refreshAccountsRpc,
   subagentCardSchema,
@@ -88,6 +91,7 @@ export default function contribute(client: PluginClientContext) {
     client.addTimelineRenderer({ kind: FALLBACK_TIMELINE_KIND, version: 1, schema: fallbackEventSchema, Component: FallbackNote }),
     client.addTimelineRenderer({ kind: SUBAGENT_TIMELINE_KIND, version: 1, schema: subagentCardSchema, Component: subagents.SubagentCardRow }),
     client.addTimelineRenderer({ kind: SUBAGENT_LIST_TIMELINE_KIND, version: 1, schema: subagentCheckSchema, Component: subagents.SubagentCheckRow }),
+    client.addTimelineRenderer({ kind: ASK_QUESTION_TIMELINE_KIND, version: 1, schema: askQuestionCardSchema, Component: AskQuestionRow }),
     registerSubagentTransforms(client),
     client.addAgentPanel({
       id: SUBAGENT_PANEL_ID,

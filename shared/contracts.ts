@@ -723,6 +723,7 @@ export const subagentArtifactRpc = defineRpc({
 
 export const SUBAGENT_TIMELINE_KIND = "antigravity-subagent";
 export const SUBAGENT_LIST_TIMELINE_KIND = "antigravity-subagents-check";
+export const ASK_QUESTION_TIMELINE_KIND = "antigravity-ask-question";
 
 export const subagentCardSchema = z.object({
   id: z.string(),
@@ -739,3 +740,18 @@ export const subagentCheckSchema = z.object({
   status: z.enum(["running", "completed", "failed", "canceled"]),
 });
 export type SubagentCheck = z.infer<typeof subagentCheckSchema>;
+
+export const askQuestionEntrySchema = z.object({
+  question: z.string(),
+  options: z.array(z.string()),
+  multiSelect: z.boolean(),
+});
+export type AskQuestionEntry = z.infer<typeof askQuestionEntrySchema>;
+
+export const askQuestionCardSchema = z.object({
+  callId: z.string(),
+  questions: z.array(askQuestionEntrySchema),
+  output: z.string().nullable(),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
+});
+export type AskQuestionCard = z.infer<typeof askQuestionCardSchema>;
