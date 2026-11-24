@@ -1,4 +1,4 @@
-import { useRpc, useTranslation } from "@getpaseo/plugin/client";
+import { useRpc, useTranslation, type PluginTranslations } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
@@ -11,7 +11,8 @@ import {
   type UsageStats,
   type UsageTotals,
 } from "../shared/contracts";
-import { clockTime, integer, monthDay, percent, tokens, usd, usdShort } from "./format";
+import { clockTime, dayLabel, integer, percent, tokens, usd, usdFixed, usdShort } from "./format";
+import { ActivityCalendar } from "./heatmap";
 import { displayLabel } from "./labels";
 import { messages } from "./messages";
 import { PricingDialog } from "./pricing";
@@ -19,7 +20,21 @@ import { font, radius, space, tabular, tint, type Colors } from "./theme";
 import { Bar, Button, Card, Muted } from "./ui";
 
 type PressState = { pressed: boolean; hovered?: boolean };
-type ChartMetric = "requests" | "cost" | "tokens" | "tps" | "cache" | "firstToken";
+type ChartMetric = "tokens" | "cost" | "requests" | "tps" | "cache" | "firstToken";
+type Resource = typeof messages extends PluginTranslations<infer R> ? R : never;
+type Translate = ReturnType<typeof useTranslation<Resource>>["t"];
+
+/** The figures the tiles show, in tile order; each tile selects its own series for the chart. */
+const METRICS: readonly ChartMetric[] = ["tokens", "cost", "requests", "tps", "cache", "firstToken"];
+
+const METRIC_LABEL = {
+  tokens: "stats.tokens",
+  cost: "stats.estimatedCost",
+  requests: "stats.requests",
+  tps: "stats.speed",
+  cache: "stats.cache",
+  firstToken: "stats.firstToken",
+} as const;
 
 /** Derived figures; null where the sums cannot support them. */
 function derive(totals: UsageTotals) {
@@ -28,6 +43,7 @@ function derive(totals: UsageTotals) {
     requests: totals.requests,
     cost: totals.pricedRequests > 0 ? totals.cost : null,
     costPerRequest: totals.pricedRequests > 0 ? totals.cost / totals.pricedRequests : null,
+    prompt,
     totalTokens: prompt + totals.output,
     tps: totals.generationSeconds > 0 ? totals.output / totals.generationSeconds : null,
     cacheRate: prompt > 0 ? totals.cached / prompt : null,
@@ -37,9 +53,38 @@ function derive(totals: UsageTotals) {
   };
 }
 
+function sumTotals(list: readonly UsageTotals[]): UsageTotals {
+  const sum: UsageTotals = {
+    requests: 0,
+    input: 0,
+    cached: 0,
+    output: 0,
+    generationSeconds: 0,
+    firstTokenSeconds: 0,
+    cost: 0,
+    pricedRequests: 0,
+  };
+  for (const item of list) {
+    sum.requests += item.requests;
+    sum.input += item.input;
+    sum.cached += item.cached;
+    sum.output += item.output;
+    sum.generationSeconds += item.generationSeconds;
+    sum.firstTokenSeconds += item.firstTokenSeconds;
+    sum.cost += item.cost;
+    sum.pricedRequests += item.pricedRequests;
+  }
+  return sum;
+}
+
 function secondsLabel(value: number | null): string {
   if (value === null) return "—";
   return `${value < 10 ? value.toFixed(1) : Math.round(value)} s`;
+}
+
+/** One decimal everywhere, so a column of latencies lines up on the point. */
+function secondsFixed(value: number | null): string {
+  return value === null ? "—" : `${value.toFixed(1)} s`;
 }
 
 function tpsLabel(value: number | null): string {
@@ -102,6 +147,25 @@ function formatAxisTick(value: number, metric: ChartMetric, locale: string): str
   }
 }
 
+/** A metric of one bin with its unit, as the chart's readout and tooltip show it. */
+function metricText(bin: UsageTotals, metric: ChartMetric, locale: string, t: Translate): string {
+  const figures = derive(bin);
+  switch (metric) {
+    case "tokens":
+      return t("stats.readoutTokens", { value: tokens(figures.totalTokens) });
+    case "cost":
+      return figures.cost === null ? "—" : usd(figures.cost, locale);
+    case "requests":
+      return t("stats.readoutRequests", { count: bin.requests, value: integer(bin.requests, locale) });
+    case "tps":
+      return figures.tps === null ? "—" : t("stats.tps", { value: tpsLabel(figures.tps) });
+    case "cache":
+      return figures.cacheRate === null ? "—" : percent(figures.cacheRate, locale);
+    case "firstToken":
+      return secondsLabel(figures.firstToken);
+  }
+}
+
 function SegmentedControl<T extends string>({
   colors,
   value,
@@ -155,13 +219,13 @@ function MiniColumns({ colors, values }: { colors: Colors; values: ReadonlyArray
   const peak = Math.max(0, ...values.map((value) => value ?? 0));
   const last = values.length - 1;
   return (
-    <View style={{ height: 28, flexDirection: "row", alignItems: "flex-end", gap: 2, borderBottomWidth: 1, borderBottomColor: tint(colors.foreground, 0.1) }}>
+    <View style={{ height: 26, flexDirection: "row", alignItems: "flex-end", gap: 2, borderBottomWidth: 1, borderBottomColor: tint(colors.foreground, 0.1) }}>
       {values.map((value, index) => (
         <View key={index} style={{ flex: 1, height: "100%", justifyContent: "flex-end" }}>
           {value && peak > 0 ? (
             <View
               style={{
-                height: Math.max(2, (value / peak) * 26),
+                height: Math.max(2, (value / peak) * 24),
                 borderTopLeftRadius: 2,
                 borderTopRightRadius: 2,
                 backgroundColor: index === last ? colors.accent : tint(colors.foreground, 0.2),
@@ -174,6 +238,7 @@ function MiniColumns({ colors, values }: { colors: Colors; values: ReadonlyArray
   );
 }
 
+/** A figure that also selects the chart's series; the selected tile carries a heavier accent edge. */
 function StatTile({
   colors,
   label,
@@ -181,6 +246,8 @@ function StatTile({
   unit,
   foot,
   width,
+  selected,
+  onPress,
   children,
 }: {
   colors: Colors;
@@ -189,29 +256,51 @@ function StatTile({
   unit?: string;
   foot: string;
   width: number | "100%";
+  selected: boolean;
+  onPress(): void;
   children: ReactNode;
 }) {
+  const edge = selected ? 2 : 1;
   return (
-    <Card colors={colors} style={{ width, padding: space.lg, gap: space.sm }}>
-      <Text numberOfLines={1} style={{ ...font.small, color: colors.foregroundMuted }}>
+    <Pressable
+      accessibilityRole="tab"
+      accessibilityState={{ selected }}
+      accessibilityLabel={`${label}: ${value}${unit ? ` ${unit}` : ""}. ${foot}`}
+      onPress={onPress}
+      style={(state) => ({
+        width,
+        padding: space.lg - edge + 1,
+        gap: space.xs,
+        borderRadius: radius.lg,
+        borderWidth: edge,
+        borderColor: selected
+          ? colors.accent
+          : (state as PressState).hovered
+            ? tint(colors.foreground, 0.24)
+            : colors.border,
+        backgroundColor: colors.surface1,
+      })}
+    >
+      <Text numberOfLines={1} style={{ ...font.small, color: selected ? colors.foreground : colors.foregroundMuted }}>
         {label}
       </Text>
       <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.xs }}>
-        <Text numberOfLines={1} style={{ fontSize: 26, lineHeight: 32, fontWeight: "600", ...tabular, color: colors.foreground }}>
+        {/* Proportional figures: tabular digits look loose at display sizes. */}
+        <Text numberOfLines={1} style={{ fontSize: 26, lineHeight: 32, fontWeight: "600", color: colors.foreground }}>
           {value}
         </Text>
         {unit ? <Text style={{ ...font.small, color: colors.foregroundMuted }}>{unit}</Text> : null}
       </View>
-      <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
+      <Text numberOfLines={2} style={{ ...font.caption, color: colors.foregroundMuted }}>
         {foot}
       </Text>
-      <View style={{ height: 28, justifyContent: "flex-end", marginTop: space.xs }}>{children}</View>
-    </Card>
+      <View style={{ height: 26, justifyContent: "flex-end", marginTop: "auto", paddingTop: space.xs }}>{children}</View>
+    </Pressable>
   );
 }
 
 function binLabel(start: number, end: number, binMs: number, locale: string): string {
-  const day = monthDay(start, locale);
+  const day = dayLabel(new Date(start), locale);
   if (binMs >= 86_400_000) return day;
   const time = clockTime(start, locale);
   const endText = clockTime(end, locale);
@@ -220,7 +309,7 @@ function binLabel(start: number, end: number, binMs: number, locale: string): st
 
 function tickLabel(start: number, binMs: number, locale: string): string {
   if (binMs >= 86_400_000 || binMs >= 6 * 3_600_000) {
-    return monthDay(start, locale);
+    return dayLabel(new Date(start), locale);
   }
   return clockTime(start, locale);
 }
@@ -233,27 +322,39 @@ function showsTick(start: number, binMs: number, index: number, total: number): 
   return date.getHours() % 6 === 0;
 }
 
+/** "Nov 23 00:00 – now" for hourly ranges, "Oct 25 – Nov 23" for days: the window the range covers. */
+function windowText(stats: UsageStats, locale: string, t: Translate): string {
+  const first = stats.bins[0];
+  const last = stats.bins[stats.bins.length - 1];
+  if (!first || !last) return "";
+  if (stats.binMs >= 86_400_000) {
+    return `${dayLabel(new Date(first.start), locale)} – ${dayLabel(new Date(last.end - 1), locale)}`;
+  }
+  return t("stats.windowSince", { start: `${dayLabel(new Date(first.start), locale)} ${clockTime(first.start, locale)}` });
+}
+
 function MetricChart({
   colors,
   stats,
   metric,
-  onMetricChange,
   locale,
   compact,
 }: {
   colors: Colors;
   stats: UsageStats;
   metric: ChartMetric;
-  onMetricChange(metric: ChartMetric): void;
   locale: string;
   compact: boolean;
 }) {
   const { t } = useTranslation(messages);
   const [hovered, setHovered] = useState<number | null>(null);
+  const [pointer, setPointer] = useState<number | null>(null);
+  const [plotWidth, setPlotWidth] = useState(0);
   const bins = stats.bins;
 
   useEffect(() => {
     setHovered(null);
+    setPointer(null);
   }, [stats.range, bins.length]);
 
   const lastActive = useMemo(() => {
@@ -264,57 +365,61 @@ function MetricChart({
   const rawValues = bins.map((entry) => metricValue(entry, metric));
   const maxVal = Math.max(0, ...rawValues);
   const peak = metric === "cache" ? 1 : niceCeiling(maxVal, metric === "firstToken" || metric === "cost");
-  const chartHeight = 132;
+  const chartHeight = 140;
   const plotTop = 8;
   const plotHeight = chartHeight - plotTop - 4;
   const topLabel = formatAxisTick(peak, metric, locale);
   const axisWidth = Math.max(28, topLabel.length * 7.5);
   const bin = bins[selected];
-  const figures = bin ? derive(bin) : null;
-  const readout = !bin
-    ? ""
-    : bin.requests === 0
-      ? t("stats.noRequests")
-      : [
-          t("stats.readoutRequests", { count: bin.requests }),
-          figures?.cost !== null && figures?.cost !== undefined ? usd(figures.cost, locale) : null,
-          figures ? t("stats.readoutTokens", { value: tokens(figures.totalTokens) }) : null,
-          figures?.tps !== null && figures?.tps !== undefined ? t("stats.readoutTps", { value: tpsLabel(figures.tps) }) : null,
-          figures?.cacheRate !== null && figures?.cacheRate !== undefined ? t("stats.readoutCache", { value: percent(figures.cacheRate, locale) }) : null,
-          figures?.firstToken !== null && figures?.firstToken !== undefined ? t("stats.readoutFirstToken", { value: secondsLabel(figures.firstToken) }) : null,
-        ]
-          .filter(Boolean)
-          .join(" · ");
   const periodKey = stats.binMs >= 86_400_000 ? "stats.perDay" : stats.binMs >= 6 * 3_600_000 ? "stats.perSixHours" : "stats.perHour";
-  const metricOptions: Array<{ value: ChartMetric; label: string }> = [
-    { value: "requests", label: t("stats.metric.requests") },
-    { value: "cost", label: t("stats.metric.cost") },
-    { value: "tokens", label: t("stats.metric.tokens") },
-    { value: "tps", label: t("stats.metric.tps") },
-    { value: "cache", label: t("stats.metric.cache") },
-    { value: "firstToken", label: t("stats.metric.firstToken") },
-  ];
+  const columnWidth = bins.length > 0 ? plotWidth / bins.length : 0;
+  const tooltipBin = pointer !== null ? bins[pointer] : undefined;
+  const tooltipCenter = pointer === null ? 0 : (pointer + 0.5) * columnWidth;
+  // Beside the bar, on the roomier side, when it fits; otherwise centered on the bar and kept inside the plot.
+  const tooltipWidth = Math.min(210, plotWidth);
+  const rightOfBar = tooltipCenter + columnWidth / 2 + 6;
+  const leftOfBar = tooltipCenter - columnWidth / 2 - 6 - tooltipWidth;
+  const fitsRight = rightOfBar + tooltipWidth <= plotWidth;
+  const fitsLeft = leftOfBar >= 0;
+  const centered = Math.min(Math.max(tooltipCenter - tooltipWidth / 2, 0), plotWidth - tooltipWidth);
+  const tooltipLeft =
+    tooltipCenter < plotWidth / 2
+      ? fitsRight
+        ? rightOfBar
+        : fitsLeft
+          ? leftOfBar
+          : centered
+      : fitsLeft
+        ? leftOfBar
+        : fitsRight
+          ? rightOfBar
+          : centered;
 
   return (
     <Card colors={colors} style={{ padding: space.lg, gap: space.md }}>
-      <View style={{ flexDirection: compact ? "column" : "row", alignItems: compact ? "flex-start" : "center", gap: space.sm }}>
-        <View
-          style={{
-            flexDirection: "row",
-            alignItems: "baseline",
-            gap: space.sm,
-            flex: compact ? undefined : 1,
-            alignSelf: compact ? "stretch" : undefined,
-            minWidth: 0,
-          }}
-        >
-          <Text style={{ ...font.heading, color: colors.foreground }}>{t(periodKey)}</Text>
-          <Text numberOfLines={compact ? 2 : 1} style={{ ...font.small, color: colors.foregroundMuted, flexShrink: 1 }}>
-            {bin ? `${binLabel(bin.start, bin.end, stats.binMs, locale)}  ` : ""}
-            <Text style={{ color: colors.foreground, ...tabular }}>{readout}</Text>
+      <View
+        style={{
+          flexDirection: compact ? "column" : "row",
+          alignItems: compact ? "flex-start" : "baseline",
+          gap: compact ? 2 : space.md,
+        }}
+      >
+        <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, flex: compact ? undefined : 1, minWidth: 0 }}>
+          <Text numberOfLines={1} style={{ ...font.heading, color: colors.foreground, flexShrink: 1 }}>
+            {t(METRIC_LABEL[metric])}
+          </Text>
+          <Text numberOfLines={1} style={{ ...font.small, color: colors.foregroundMuted }}>
+            {t(periodKey)}
           </Text>
         </View>
-        <SegmentedControl colors={colors} value={metric} options={metricOptions} onChange={onMetricChange} />
+        {bin ? (
+          <Text numberOfLines={1} style={{ ...font.small, color: colors.foregroundMuted }}>
+            {`${binLabel(bin.start, bin.end, stats.binMs, locale)}   `}
+            <Text style={{ color: colors.foreground, fontWeight: "600", ...tabular }}>
+              {bin.requests === 0 ? t("stats.noRequests") : metricText(bin, metric, locale, t)}
+            </Text>
+          </Text>
+        ) : null}
       </View>
 
       <View style={{ flexDirection: "row", gap: space.sm }}>
@@ -336,7 +441,7 @@ function MetricChart({
             </Text>
           ))}
         </View>
-        <View style={{ flex: 1 }}>
+        <View style={{ flex: 1 }} onLayout={(event) => setPlotWidth(event.nativeEvent.layout.width)}>
           <View style={{ height: chartHeight }}>
             <View style={{ position: "absolute", left: 0, right: 0, top: plotTop, height: 1, backgroundColor: tint(colors.foreground, 0.07) }} />
             <View style={{ position: "absolute", left: 0, right: 0, top: plotTop + plotHeight / 2, height: 1, backgroundColor: tint(colors.foreground, 0.07) }} />
@@ -350,16 +455,24 @@ function MetricChart({
                   <Pressable
                     key={entry.start}
                     accessibilityRole="button"
-                    accessibilityLabel={`${binLabel(entry.start, entry.end, stats.binMs, locale)}: ${t("stats.readoutRequests", { count: entry.requests })}`}
-                    onHoverIn={() => setHovered(index)}
-                    onHoverOut={() => setHovered((current) => (current === index ? null : current))}
+                    accessibilityLabel={`${binLabel(entry.start, entry.end, stats.binMs, locale)}: ${
+                      entry.requests === 0 ? t("stats.noRequests") : metricText(entry, metric, locale, t)
+                    }`}
+                    onHoverIn={() => {
+                      setHovered(index);
+                      setPointer(index);
+                    }}
+                    onHoverOut={() => {
+                      setHovered((current) => (current === index ? null : current));
+                      setPointer((current) => (current === index ? null : current));
+                    }}
                     onPressIn={() => setHovered(index)}
                     style={(state) => ({
                       flex: 1,
                       height: "100%",
                       alignItems: "center",
                       justifyContent: "flex-end",
-                      backgroundColor: (state as PressState).hovered ? tint(colors.foreground, 0.03) : "transparent",
+                      backgroundColor: (state as PressState).hovered ? tint(colors.foreground, 0.04) : "transparent",
                     })}
                   >
                     {height > 0 ? (
@@ -378,6 +491,7 @@ function MetricChart({
                 );
               })}
             </View>
+
           </View>
           <View style={{ flexDirection: "row", marginTop: space.xs, height: 16 }}>
             {bins.map((entry, index) => (
@@ -392,10 +506,92 @@ function MetricChart({
               </View>
             ))}
           </View>
+            {tooltipBin && columnWidth > 0 ? (
+              <View
+                pointerEvents="none"
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: tooltipLeft,
+                  width: tooltipWidth,
+                  padding: space.sm + 2,
+                  gap: 3,
+                  borderRadius: radius.md,
+                  borderWidth: 1,
+                  borderColor: colors.border,
+                  backgroundColor: colors.surface0,
+                  shadowColor: "#000",
+                  shadowOpacity: 0.12,
+                  shadowRadius: 10,
+                  shadowOffset: { width: 0, height: 4 },
+                  elevation: 4,
+                }}
+              >
+                <Text numberOfLines={1} style={{ ...font.caption, ...tabular, color: colors.foregroundMuted, marginBottom: 2 }}>
+                  {binLabel(tooltipBin.start, tooltipBin.end, stats.binMs, locale)}
+                </Text>
+                {tooltipBin.requests === 0 ? (
+                  <Text style={{ ...font.small, color: colors.foreground }}>{t("stats.noRequests")}</Text>
+                ) : (
+                  METRICS.map((item) => (
+                    <View key={item} style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
+                      <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted, flex: 1 }}>
+                        {t(METRIC_LABEL[item])}
+                      </Text>
+                      <Text
+                        numberOfLines={1}
+                        style={{
+                          ...font.caption,
+                          ...tabular,
+                          color: colors.foreground,
+                          fontWeight: item === metric ? "700" : "500",
+                        }}
+                      >
+                        {item === "requests"
+                          ? integer(tooltipBin.requests, locale)
+                          : item === "tokens"
+                            ? tokens(derive(tooltipBin).totalTokens)
+                            : metricText(tooltipBin, item, locale, t)}
+                      </Text>
+                    </View>
+                  ))
+                )}
+              </View>
+            ) : null}
         </View>
       </View>
     </Card>
   );
+}
+
+type SortKey = "requests" | "tokens" | "cost" | "context" | "output" | "speed" | "cache" | "firstToken";
+type ShareKey = "requests" | "tokens" | "cost";
+
+function sortValue(figures: ReturnType<typeof derive>, key: SortKey): number | null {
+  switch (key) {
+    case "requests":
+      return figures.requests;
+    case "tokens":
+      return figures.totalTokens;
+    case "cost":
+      return figures.cost;
+    case "context":
+      return figures.context;
+    case "output":
+      return figures.output;
+    case "speed":
+      return figures.tps;
+    case "cache":
+      return figures.cacheRate;
+    case "firstToken":
+      return figures.firstToken;
+  }
+}
+
+function shareValue(figures: ReturnType<typeof derive>, key: ShareKey): number {
+  if (key === "requests") return figures.requests;
+  if (key === "cost") return figures.cost ?? 0;
+  return figures.totalTokens;
 }
 
 function ModelTable({
@@ -416,163 +612,287 @@ function ModelTable({
   onEditPricing(pricingKey: string): void;
 }) {
   const { t } = useTranslation(messages);
-  const top = Math.max(1, ...stats.models.map((model) => model.requests));
-  const totalAllModels = stats.models.reduce((sum, item) => sum + item.requests, 0);
-  const columns = [
-    { key: "requests", label: t("stats.col.requests"), width: 68 },
-    { key: "cost", label: t("stats.col.cost"), width: 82 },
-    { key: "context", label: t("stats.col.context"), width: 78 },
-    { key: "output", label: t("stats.col.output"), width: 74 },
-    { key: "speed", label: t("stats.col.speed"), width: 82 },
-    { key: "cache", label: t("stats.col.cache"), width: 64 },
-    { key: "firstToken", label: t("stats.col.firstToken"), width: 68 },
-  ] as const;
+  const [sort, setSort] = useState<{ key: SortKey; descending: boolean }>({ key: "tokens", descending: true });
+  // The share bar shows whichever additive column the table is sorted by; tokens otherwise.
+  const shareKey: ShareKey = sort.key === "requests" || sort.key === "cost" ? sort.key : "tokens";
+  const rows = useMemo(() => {
+    const list = stats.models.map((model) => ({ model, figures: derive(model) }));
+    list.sort((left, right) => {
+      const a = sortValue(left.figures, sort.key);
+      const b = sortValue(right.figures, sort.key);
+      // Rows without the figure (an unpriced model's cost) always sit at the bottom.
+      if (a === null || b === null) return a === null ? (b === null ? 0 : 1) : -1;
+      return sort.descending ? b - a : a - b;
+    });
+    return list;
+  }, [stats.models, sort]);
+  const totals = useMemo(() => derive(sumTotals(stats.models)), [stats.models]);
+  const shareTotal = rows.reduce((sum, row) => sum + shareValue(row.figures, shareKey), 0);
+
+  const columns: ReadonlyArray<{ key: SortKey; label: string; width: number }> = [
+    { key: "requests", label: t("stats.col.requests"), width: 70 },
+    { key: "tokens", label: t("stats.col.tokens"), width: 66 },
+    { key: "cost", label: t("stats.col.cost"), width: 78 },
+    { key: "context", label: t("stats.col.context"), width: 86 },
+    { key: "output", label: t("stats.col.output"), width: 80 },
+    { key: "speed", label: t("stats.col.speed"), width: 78 },
+    { key: "cache", label: t("stats.col.cache"), width: 66 },
+    { key: "firstToken", label: t("stats.col.firstToken"), width: 78 },
+  ];
+
+  const cellsOf = (figures: ReturnType<typeof derive>): Record<SortKey, string> => ({
+    requests: integer(figures.requests, locale),
+    tokens: tokens(figures.totalTokens),
+    cost: figures.cost === null ? "—" : usdFixed(figures.cost, locale),
+    context: figures.context === null ? "—" : tokens(Math.round(figures.context)),
+    output: figures.output === null ? "—" : tokens(Math.round(figures.output)),
+    speed: figures.tps === null ? "—" : t("stats.tps", { value: tpsLabel(figures.tps) }),
+    cache: figures.cacheRate === null ? "—" : percent(figures.cacheRate, locale),
+    firstToken: secondsFixed(figures.firstToken),
+  });
+
+  const toggleSort = (key: SortKey) =>
+    setSort((current) => (current.key === key ? { key, descending: !current.descending } : { key, descending: true }));
+
+  const rowFrame = {
+    paddingHorizontal: space.sm,
+    marginHorizontal: -space.sm,
+    borderRadius: radius.md,
+  } as const;
+
+  /**
+   * The model's name with a thin bar of its share laid under it. The bar sits outside the layout, so
+   * the row stays one line and every figure shares the name's baseline.
+   */
+  const nameCell = (label: string, share: number | null) => (
+    <View style={{ flex: 1, minWidth: 0, alignSelf: "stretch", justifyContent: "center", marginRight: space.lg }}>
+      <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
+        <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: colors.foreground, flexShrink: 1 }}>
+          {label}
+        </Text>
+        <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
+          {share === null ? "—" : share > 0 && share < 0.001 ? `<${percent(0.001, locale)}` : percent(share, locale)}
+        </Text>
+      </View>
+      {/* Below one percent the bar would be a stray speck; the figure beside the name carries it. */}
+      {share !== null && share >= 0.01 ? (
+        <View style={{ position: "absolute", left: 0, right: 0, bottom: 6, height: 3 }}>
+          <View
+            style={{
+              width: `${Math.min(1, share) * 100}%`,
+              height: 3,
+              borderRadius: 1.5,
+              backgroundColor: colors.accent,
+            }}
+          />
+        </View>
+      ) : null}
+    </View>
+  );
+
+  const costCell = (pricingKey: string, model: string, text: string, unpriced: boolean, width?: number) => (
+    <Pressable
+      key="cost"
+      accessibilityRole="button"
+      accessibilityLabel={t("pricing.editFor", { model })}
+      hitSlop={6}
+      onPress={(event) => {
+        event.stopPropagation?.();
+        onEditPricing(pricingKey);
+      }}
+      style={(state) => ({ width, alignItems: "flex-end", opacity: (state as PressState).hovered ? 0.7 : 1 })}
+    >
+      <Text numberOfLines={1} style={{ ...font.small, ...tabular, color: unpriced ? colors.statusWarning : colors.foreground }}>
+        {text}
+      </Text>
+    </Pressable>
+  );
 
   return (
-    <Card colors={colors} style={{ padding: space.lg, gap: space.md }}>
-      <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
+    <Card colors={colors} style={{ padding: space.lg, gap: space.sm }}>
+      <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, marginBottom: space.xs }}>
         <Text style={{ ...font.heading, color: colors.foreground, flex: 1 }}>{t("stats.models")}</Text>
         <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("stats.modelsHint")}</Text>
       </View>
+
       {wide ? (
-        <View style={{ flexDirection: "row", alignItems: "center", paddingBottom: space.sm, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+        <View
+          style={{
+            ...rowFrame,
+            flexDirection: "row",
+            alignItems: "flex-end",
+            paddingBottom: space.sm,
+            borderBottomWidth: 1,
+            borderBottomColor: colors.border,
+            borderRadius: 0,
+          }}
+        >
           <Text style={{ ...font.caption, color: colors.foregroundMuted, flex: 1 }}>{t("stats.col.model")}</Text>
-          {columns.map((column) => (
-            <Text key={column.key} style={{ ...font.caption, color: colors.foregroundMuted, width: column.width, textAlign: "right" }}>
-              {column.label}
-            </Text>
-          ))}
+          {columns.map((column) => {
+            const active = sort.key === column.key;
+            return (
+              <Pressable
+                key={column.key}
+                accessibilityRole="button"
+                accessibilityLabel={t("stats.sortBy", { column: column.label })}
+                accessibilityState={{ selected: active }}
+                onPress={() => toggleSort(column.key)}
+                style={(state) => ({
+                  width: column.width,
+                  flexDirection: "row",
+                  justifyContent: "flex-end",
+                  alignItems: "center",
+                  gap: 2,
+                  opacity: (state as PressState).hovered && !active ? 0.75 : 1,
+                })}
+              >
+                {active ? <Icon name={sort.descending ? "ArrowDown" : "ArrowUp"} size={11} color={colors.foreground} /> : null}
+                <Text
+                  numberOfLines={1}
+                  style={{ ...font.caption, color: active ? colors.foreground : colors.foregroundMuted, fontWeight: active ? "600" : "400" }}
+                >
+                  {column.label}
+                </Text>
+              </Pressable>
+            );
+          })}
         </View>
       ) : null}
-      {stats.models.map((model, index) => {
-        const figures = derive(model);
-        const share = totalAllModels > 0 ? model.requests / totalAllModels : 0;
-        const active = selectedModel === model.label;
-        const dimmed = selectedModel !== null && !active;
-        const costText = figures.cost === null ? "—" : usd(figures.cost, locale);
-        const values = {
-          requests: integer(model.requests, locale),
-          cost: costText,
-          context: figures.context === null ? "—" : tokens(Math.round(figures.context)),
-          output: figures.output === null ? "—" : tokens(Math.round(figures.output)),
-          speed: figures.tps === null ? "—" : t("stats.tps", { value: tpsLabel(figures.tps) }),
-          cache: figures.cacheRate === null ? "—" : percent(figures.cacheRate, locale),
-          firstToken: secondsLabel(figures.firstToken),
-        };
-        const name = (
-          <View style={{ flex: 1, minWidth: 0, gap: 6, paddingRight: space.md }}>
-            <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
-              <Text numberOfLines={1} style={{ ...font.small, fontWeight: "600", color: active ? colors.accent : colors.foreground, flexShrink: 1 }}>
-                {model.label}
-              </Text>
-              <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>{percent(share, locale)}</Text>
-            </View>
-            <Bar colors={colors} fraction={model.requests / top} tone="accent" height={4} />
-          </View>
-        );
-        return (
-          <Pressable
-            key={model.label}
-            accessibilityRole="button"
-            accessibilityState={{ selected: active }}
-            onPress={() => onSelectModel(active ? null : model.label)}
-            style={(state) => ({
-              paddingVertical: space.sm,
-              paddingHorizontal: space.sm,
-              marginHorizontal: -space.sm,
-              borderRadius: radius.md,
-              borderTopWidth: index === 0 || wide ? 0 : 1,
-              borderTopColor: colors.border,
-              gap: space.sm,
-              opacity: dimmed ? 0.55 : 1,
-              backgroundColor: active
-                ? tint(colors.accent, 0.08)
-                : (state as PressState).hovered
-                  ? tint(colors.foreground, 0.04)
-                  : "transparent",
-            })}
-          >
-            {wide ? (
-              <View style={{ flexDirection: "row", alignItems: "center" }}>
-                {name}
-                {columns.map((column) =>
-                  column.key === "cost" ? (
-                    <Pressable
-                      key={column.key}
-                      accessibilityRole="button"
-                      accessibilityLabel={t("pricing.editFor", { model: model.label })}
-                      onPress={(event) => {
-                        event.stopPropagation?.();
-                        onEditPricing(model.pricingKey);
-                      }}
-                      style={{ width: column.width, alignItems: "flex-end" }}
-                    >
+
+      <View>
+        {rows.map(({ model, figures }, index) => {
+          const share =
+            shareKey === "cost" && figures.cost === null ? null : shareTotal > 0 ? shareValue(figures, shareKey) / shareTotal : 0;
+          const active = selectedModel === model.label;
+          const dimmed = selectedModel !== null && !active;
+          const cells = cellsOf(figures);
+          return (
+            <Pressable
+              key={model.label}
+              accessibilityRole="button"
+              accessibilityState={{ selected: active }}
+              onPress={() => onSelectModel(active ? null : model.label)}
+              style={(state) => ({
+                ...rowFrame,
+                minHeight: wide ? 44 : undefined,
+                paddingVertical: wide ? 0 : space.sm,
+                flexDirection: wide ? "row" : "column",
+                alignItems: wide ? "center" : "stretch",
+                gap: wide ? 0 : space.xs,
+                borderTopWidth: index === 0 ? 0 : 1,
+                borderTopColor: tint(colors.foreground, 0.06),
+                opacity: dimmed ? 0.5 : 1,
+                backgroundColor: active
+                  ? tint(colors.accent, 0.08)
+                  : (state as PressState).hovered
+                    ? tint(colors.foreground, 0.04)
+                    : "transparent",
+              })}
+            >
+              {wide ? (
+                <>
+                  {nameCell(model.label, share)}
+                  {columns.map((column) =>
+                    column.key === "cost" ? (
+                      costCell(model.pricingKey, model.label, cells.cost, figures.cost === null, column.width)
+                    ) : (
                       <Text
+                        key={column.key}
                         numberOfLines={1}
-                        style={{
-                          ...font.small,
-                          ...tabular,
-                          color: figures.cost === null ? colors.statusWarning : colors.foreground,
-                          fontWeight: "500",
-                        }}
+                        style={{ ...font.small, ...tabular, color: colors.foreground, width: column.width, textAlign: "right" }}
                       >
-                        {values.cost}
+                        {cells[column.key]}
                       </Text>
-                    </Pressable>
-                  ) : (
+                    ),
+                  )}
+                </>
+              ) : (
+                <>
+                  <View style={{ flexDirection: "row", alignItems: "center", minHeight: 42 }}>
+                    {nameCell(model.label, share)}
+                    <Text style={{ ...font.small, ...tabular, fontWeight: "600", color: colors.foreground }}>
+                      {t("stats.readoutTokens", { value: cells.tokens })}
+                    </Text>
+                  </View>
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "baseline", columnGap: space.sm }}>
+                    <Muted colors={colors} small>
+                      {t("stats.readoutRequests", { count: figures.requests, value: integer(figures.requests, locale) })}
+                    </Muted>
+                    {costCell(model.pricingKey, model.label, cells.cost, figures.cost === null)}
+                    <Muted colors={colors} small>
+                      {[
+                        `${t("stats.col.context")} ${cells.context}`,
+                        `${t("stats.col.output")} ${cells.output}`,
+                        cells.speed,
+                        `${t("stats.col.cache")} ${cells.cache}`,
+                        `${t("stats.col.firstToken")} ${cells.firstToken}`,
+                      ].join(" · ")}
+                    </Muted>
+                  </View>
+                </>
+              )}
+            </Pressable>
+          );
+        })}
+
+        {rows.length > 1 ? (
+          <View
+            style={{
+              ...rowFrame,
+              flexDirection: wide ? "row" : "column",
+              alignItems: wide ? "center" : "stretch",
+              minHeight: wide ? 44 : undefined,
+              paddingVertical: wide ? 0 : space.sm,
+              gap: wide ? 0 : space.xs,
+              borderTopWidth: 1,
+              borderTopColor: colors.border,
+              borderRadius: 0,
+            }}
+          >
+            {(() => {
+              const cells = cellsOf(totals);
+              const label = (
+                <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground, flex: 1 }}>
+                  {t("stats.col.total")}
+                </Text>
+              );
+              return wide ? (
+                <>
+                  {label}
+                  {columns.map((column) => (
                     <Text
                       key={column.key}
                       numberOfLines={1}
-                      style={{ ...font.small, ...tabular, color: colors.foreground, width: column.width, textAlign: "right" }}
-                    >
-                      {values[column.key]}
-                    </Text>
-                  ),
-                )}
-              </View>
-            ) : (
-              <>
-                <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
-                  {name}
-                  <Pressable
-                    accessibilityRole="button"
-                    accessibilityLabel={t("pricing.editFor", { model: model.label })}
-                    hitSlop={8}
-                    onPress={(event) => {
-                      event.stopPropagation?.();
-                      onEditPricing(model.pricingKey);
-                    }}
-                    style={{ minHeight: 28, justifyContent: "center", paddingHorizontal: 6 }}
-                  >
-                    <Text
                       style={{
                         ...font.small,
                         ...tabular,
                         fontWeight: "600",
-                        color: figures.cost === null ? colors.statusWarning : colors.foreground,
+                        color: column.key === "cost" && totals.cost === null ? colors.statusWarning : colors.foreground,
+                        width: column.width,
+                        textAlign: "right",
                       }}
                     >
-                      {values.cost}
+                      {cells[column.key]}
                     </Text>
-                  </Pressable>
-                  <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
-                    {t("stats.readoutRequests", { count: model.requests })}
-                  </Text>
-                </View>
-                <Muted colors={colors} small>
-                  {[
-                    `${t("stats.col.context")} ${values.context}`,
-                    `${t("stats.col.output")} ${values.output}`,
-                    values.speed,
-                    `${t("stats.col.cache")} ${values.cache}`,
-                    `${t("stats.col.firstToken")} ${values.firstToken}`,
-                  ].join(" · ")}
-                </Muted>
-              </>
-            )}
-          </Pressable>
-        );
-      })}
+                  ))}
+                </>
+              ) : (
+                <>
+                  <View style={{ flexDirection: "row", alignItems: "center" }}>
+                    {label}
+                    <Text style={{ ...font.small, ...tabular, fontWeight: "600", color: colors.foreground }}>
+                      {t("stats.readoutTokens", { value: cells.tokens })}
+                    </Text>
+                  </View>
+                  <Muted colors={colors} small>
+                    {[t("stats.readoutRequests", { count: totals.requests, value: integer(totals.requests, locale) }), cells.cost, cells.speed, `${t("stats.col.cache")} ${cells.cache}`].join(" · ")}
+                  </Muted>
+                </>
+              );
+            })()}
+          </View>
+        ) : null}
+      </View>
     </Card>
   );
 }
@@ -593,7 +913,7 @@ export function UsageSection({
   const [scope, setScope] = useState<StatsScope>("all");
   const [accountId, setAccountId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
-  const [metric, setMetric] = useState<ChartMetric>("requests");
+  const [metric, setMetric] = useState<ChartMetric>("tokens");
   const [pricingOpen, setPricingOpen] = useState<{ open: boolean; focusKey?: string | null }>({ open: false });
   const read = useRpc(usageStatsRpc);
   const query = useQuery({
@@ -607,17 +927,27 @@ export function UsageSection({
       }),
     refetchInterval: 60_000,
     staleTime: 30_000,
+    // Keep the last figures on screen while a new range or filter loads, instead of flashing empty tiles.
+    placeholderData: (previous) => previous,
   });
   const stats = query.data;
   const gap = compact ? space.md : space.lg;
-  const columns = width >= 880 ? 5 : width >= 420 ? 2 : 1;
-  const tileWidth = columns === 1 ? "100%" : (width - gap * (columns - 1)) / columns;
+  // The console caps its content at 980 points, so six tiles never fit in one row.
+  const columns = width >= 600 ? 3 : 2;
+  const tileWidth = Math.floor((width - gap * (columns - 1)) / columns);
   const totals = stats ? derive(stats.totals) : null;
   const series = (pick: (bin: UsageTotals) => number | null) => (stats ? stats.bins.map((bin) => pick(bin)) : []);
   const hasSubagents = (stats?.breakdown.subagent.requests ?? 0) > 0;
   const accountChips = stats?.accounts ?? [];
   const accountKindById = useMemo(() => new Map(accounts.map((a) => [a.id, a.kind])), [accounts]);
   const unpriced = stats ? stats.totals.requests - stats.totals.pricedRequests : 0;
+  const tile = (key: ChartMetric) => ({
+    colors,
+    width: tileWidth,
+    label: t(METRIC_LABEL[key]),
+    selected: metric === key,
+    onPress: () => setMetric(key),
+  });
 
   return (
     <View style={{ gap: space.md }}>
@@ -647,16 +977,6 @@ export function UsageSection({
             }}
           />
         ) : null}
-        <SegmentedControl<StatsRange>
-          colors={colors}
-          value={range}
-          options={[
-            { value: "24h", label: t("stats.range.24h") },
-            { value: "7d", label: t("stats.range.7d") },
-            { value: "30d", label: t("stats.range.30d") },
-          ]}
-          onChange={setRange}
-        />
       </View>
 
       {accountChips.length > 1 || accountId !== null || selectedModel ? (
@@ -759,109 +1079,125 @@ export function UsageSection({
       ) : null}
 
       {query.error ? <Muted colors={colors}>{(query.error as Error).message}</Muted> : null}
-      <View style={{ flexDirection: "row", flexWrap: "wrap", gap }}>
-        <StatTile
+
+      <ActivityCalendar
+        colors={colors}
+        width={width}
+        compact={compact}
+        scope={scope}
+        accountId={accountId}
+        model={selectedModel}
+      />
+
+      {/* The range scopes everything below it; the calendar above always covers a year. */}
+      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.sm, marginTop: space.sm }}>
+        <Text numberOfLines={1} style={{ ...font.small, ...tabular, color: colors.foregroundMuted, flex: 1, minWidth: 120 }}>
+          {stats ? windowText(stats, locale, t) : ""}
+        </Text>
+        <SegmentedControl<StatsRange>
           colors={colors}
-          width={tileWidth}
-          label={t("stats.estimatedCost")}
-          value={totals?.cost !== null && totals?.cost !== undefined ? usd(totals.cost, locale) : "—"}
-          foot={
-            totals?.costPerRequest !== null && totals?.costPerRequest !== undefined
-              ? unpriced > 0
-                ? t("stats.costWithUnpriced", { avg: usd(totals.costPerRequest, locale), unpriced })
-                : stats?.hasCustomPricing
-                  ? t("stats.costAvgCustom", { avg: usd(totals.costPerRequest, locale) })
-                  : t("stats.costAvg", { avg: usd(totals.costPerRequest, locale) })
-              : " "
-          }
-        >
-          <MiniColumns colors={colors} values={series((bin) => bin.cost)} />
-        </StatTile>
-        <StatTile
-          colors={colors}
-          width={tileWidth}
-          label={t("stats.requests")}
-          value={totals ? integer(totals.requests, locale) : "—"}
-          foot={
-            stats
-              ? hasSubagents && scope === "all" && !selectedModel
-                ? t("stats.splitSummary", {
-                    main: integer(stats.breakdown.main.requests, locale),
-                    subagent: integer(stats.breakdown.subagent.requests, locale),
-                  })
-                : t("stats.conversations", { count: stats.conversations })
-              : " "
-          }
-        >
-          <MiniColumns colors={colors} values={series((bin) => bin.requests)} />
-        </StatTile>
-        <StatTile
-          colors={colors}
-          width={tileWidth}
-          label={t("stats.speed")}
-          value={tpsLabel(totals?.tps ?? null)}
-          unit="tok/s"
-          foot={stats ? t("stats.outputTokens", { value: tokens(stats.totals.output) }) : " "}
-        >
-          <MiniColumns colors={colors} values={series((bin) => derive(bin).tps)} />
-        </StatTile>
-        <StatTile
-          colors={colors}
-          width={tileWidth}
-          label={t("stats.cache")}
-          value={totals?.cacheRate !== null && totals?.cacheRate !== undefined ? percent(totals.cacheRate, locale) : "—"}
-          foot={stats ? t("stats.cachedTokens", { value: tokens(stats.totals.cached) }) : " "}
-        >
-          <View style={{ paddingBottom: 4 }}>
-            <Bar colors={colors} fraction={totals?.cacheRate ?? 0} tone={totals?.cacheRate === null ? "neutral" : "accent"} height={8} />
-          </View>
-        </StatTile>
-        <StatTile
-          colors={colors}
-          width={tileWidth}
-          label={t("stats.firstToken")}
-          value={totals?.firstToken !== null && totals?.firstToken !== undefined ? secondsLabel(totals.firstToken).replace(" s", "") : "—"}
-          unit="s"
-          foot={totals?.context !== null && totals?.context !== undefined ? t("stats.avgContext", { value: tokens(Math.round(totals.context)) }) : " "}
-        >
-          <MiniColumns colors={colors} values={series((bin) => derive(bin).firstToken)} />
-        </StatTile>
+          value={range}
+          options={[
+            { value: "24h", label: t("stats.range.24h") },
+            { value: "7d", label: t("stats.range.7d") },
+            { value: "30d", label: t("stats.range.30d") },
+          ]}
+          onChange={setRange}
+        />
       </View>
-      {stats && stats.totals.requests === 0 ? (
-        <Card colors={colors} style={{ padding: space.xl, alignItems: "center" }}>
-          <Muted colors={colors}>{t("stats.empty")}</Muted>
-        </Card>
-      ) : null}
-      {stats && stats.totals.requests > 0 ? (
-        <>
-          <MetricChart
-            colors={colors}
-            stats={stats}
-            metric={metric}
-            onMetricChange={setMetric}
-            locale={locale}
-            compact={compact || width < 640}
-          />
-          {stats.models.length > 0 ? (
-            <ModelTable
-              colors={colors}
-              stats={stats}
-              locale={locale}
-              wide={width >= 760}
-              selectedModel={selectedModel}
-              onSelectModel={setSelectedModel}
-              onEditPricing={(pricingKey) => setPricingOpen({ open: true, focusKey: pricingKey })}
-            />
-          ) : null}
-        </>
-      ) : null}
+
+      <View style={{ gap: space.md, opacity: query.isPlaceholderData ? 0.6 : 1 }}>
+        <View accessibilityRole="tablist" style={{ flexDirection: "row", flexWrap: "wrap", gap }}>
+          <StatTile
+            {...tile("tokens")}
+            value={totals ? tokens(totals.totalTokens) : "—"}
+            foot={totals ? t("stats.tokensSplit", { input: tokens(totals.prompt), output: tokens(stats!.totals.output) }) : " "}
+          >
+            <MiniColumns colors={colors} values={series((bin) => derive(bin).totalTokens)} />
+          </StatTile>
+          <StatTile
+            {...tile("cost")}
+            value={totals?.cost !== null && totals?.cost !== undefined ? usd(totals.cost, locale) : "—"}
+            foot={
+              totals?.costPerRequest !== null && totals?.costPerRequest !== undefined
+                ? unpriced > 0
+                  ? t("stats.costWithUnpriced", { avg: usd(totals.costPerRequest, locale), unpriced })
+                  : stats?.hasCustomPricing
+                    ? t("stats.costAvgCustom", { avg: usd(totals.costPerRequest, locale) })
+                    : t("stats.costAvg", { avg: usd(totals.costPerRequest, locale) })
+                : " "
+            }
+          >
+            <MiniColumns colors={colors} values={series((bin) => bin.cost)} />
+          </StatTile>
+          <StatTile
+            {...tile("requests")}
+            value={totals ? integer(totals.requests, locale) : "—"}
+            foot={
+              stats
+                ? hasSubagents && scope === "all" && !selectedModel
+                  ? t("stats.splitSummary", {
+                      main: integer(stats.breakdown.main.requests, locale),
+                      subagent: integer(stats.breakdown.subagent.requests, locale),
+                    })
+                  : t("stats.conversations", { count: stats.conversations, value: integer(stats.conversations, locale) })
+                : " "
+            }
+          >
+            <MiniColumns colors={colors} values={series((bin) => bin.requests)} />
+          </StatTile>
+          <StatTile
+            {...tile("tps")}
+            value={tpsLabel(totals?.tps ?? null)}
+            unit="tok/s"
+            foot={totals?.output !== null && totals?.output !== undefined ? t("stats.avgOutput", { value: tokens(Math.round(totals.output)) }) : " "}
+          >
+            <MiniColumns colors={colors} values={series((bin) => derive(bin).tps)} />
+          </StatTile>
+          <StatTile
+            {...tile("cache")}
+            value={totals?.cacheRate !== null && totals?.cacheRate !== undefined ? percent(totals.cacheRate, locale) : "—"}
+            foot={stats ? t("stats.cachedTokens", { value: tokens(stats.totals.cached) }) : " "}
+          >
+            <View style={{ paddingBottom: 4 }}>
+              <Bar colors={colors} fraction={totals?.cacheRate ?? 0} tone={totals?.cacheRate === null ? "neutral" : "accent"} height={8} />
+            </View>
+          </StatTile>
+          <StatTile
+            {...tile("firstToken")}
+            value={totals?.firstToken !== null && totals?.firstToken !== undefined ? secondsLabel(totals.firstToken).replace(" s", "") : "—"}
+            unit="s"
+            foot={totals?.context !== null && totals?.context !== undefined ? t("stats.avgContext", { value: tokens(Math.round(totals.context)) }) : " "}
+          >
+            <MiniColumns colors={colors} values={series((bin) => derive(bin).firstToken)} />
+          </StatTile>
+        </View>
+
+        {stats && stats.totals.requests === 0 ? (
+          <Card colors={colors} style={{ padding: space.xl, alignItems: "center" }}>
+            <Muted colors={colors}>{t("stats.empty")}</Muted>
+          </Card>
+        ) : null}
+        {stats && stats.totals.requests > 0 ? (
+          <>
+            <MetricChart colors={colors} stats={stats} metric={metric} locale={locale} compact={compact || width < 640} />
+            {stats.models.length > 0 ? (
+              <ModelTable
+                colors={colors}
+                stats={stats}
+                locale={locale}
+                wide={width >= 820}
+                selectedModel={selectedModel}
+                onSelectModel={setSelectedModel}
+                onEditPricing={(pricingKey) => setPricingOpen({ open: true, focusKey: pricingKey })}
+              />
+            ) : null}
+          </>
+        ) : null}
+      </View>
 
       {pricingOpen.open ? (
-        <PricingDialog
-          colors={colors}
-          focusKey={pricingOpen.focusKey}
-          onClose={() => setPricingOpen({ open: false })}
-        />
+        <PricingDialog colors={colors} focusKey={pricingOpen.focusKey} onClose={() => setPricingOpen({ open: false })} />
       ) : null}
     </View>
   );

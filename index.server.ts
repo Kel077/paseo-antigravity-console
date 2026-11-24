@@ -27,6 +27,7 @@ import {
   subagentDetailRpc,
   submitSignInRpc,
   switchAgentAccountRpc,
+  usageDailyRpc,
   usageStatsRpc,
   watchAccountsSubscription,
 } from "./shared/contracts";
@@ -206,6 +207,11 @@ export default function contribute(server: PluginServerContext) {
   server.handle(usageStatsRpc, async (filter) => {
     await ready;
     return stats.summary(filter, (id) => service.labelOf(id), pricing.snapshot());
+  });
+
+  server.handle(usageDailyRpc, async (filter) => {
+    await ready;
+    return stats.daily(filter, pricing.snapshot());
   });
 
   server.handle(getPricingRpc, async () => {

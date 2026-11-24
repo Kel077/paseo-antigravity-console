@@ -36,9 +36,11 @@ Works across Paseo desktop, web, and mobile (iOS & Android), with English and Si
   - Registers all added profile accounts as a Paseo usage source so they appear alongside the system sign-in in Paseo's built-in **Usage** view.
 
 - **Usage analytics & customizable API cost estimates**
-  - Tracks requests, estimated USD cost, input/cached/output tokens, output speed (`tok/s`), cache hit rate, and time to first token across **24 hours** (hourly), **7 days** (6-hour), or **30 days** (DST-safe calendar days).
-  - Filter by **conversation scope** (`All`, `Main`, `Subagents`), **attributed account** (showing per-account request count and cost), or **model** (click any model row to filter the chart).
-  - Switch the interactive bar chart across 6 metrics: `Requests`, `Cost`, `Tokens`, `Speed`, `Cache`, and `First token`.
+  - A GitHub-style **daily token calendar** covers the last year (fewer weeks on narrow screens), shaded by quartiles of your active days, with active days, busiest day, average per active day, and current streak. Hover or tap a day for its tokens, requests, and cost.
+  - Tracks total tokens (input, cached, and output), estimated USD cost, requests, output speed (`tok/s`), cache hit rate, and time to first token across **24 hours** (hourly), **7 days** (6-hour), or **30 days** (DST-safe calendar days).
+  - Filter by **conversation scope** (`All`, `Main`, `Subagents`), **attributed account** (showing per-account request count and cost), or **model** (click any model row to filter the whole dashboard, calendar included).
+  - Click a stat tile to chart that metric; hover a bar to read every metric for that period.
+  - The per-model table sorts by any column, shows each model's share of the sorted total, and ends with a totals row.
   - Built-in official token pricing for Google AI Studio, Anthropic, and OpenAI models (including scheduled rate changes and `>200K` long-context tiers). Open **API pricing** (or click any model's cost) to customize input/cached/output and `>200K` rates, add custom model keys, or reset to official defaults.
 
 - **Subagents timeline cards, workspace badges, & inspector panel**

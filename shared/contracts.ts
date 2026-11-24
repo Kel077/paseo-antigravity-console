@@ -449,6 +449,36 @@ export const usageStatsRpc = defineRpc({
   output: usageStatsSchema,
 });
 
+/** Local calendar days the activity calendar covers: 53 weeks, so any week start fits a full year. */
+export const DAILY_HISTORY_DAYS = 371;
+
+const dayKeySchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+
+export const usageDaySchema = usageTotalsSchema.extend({ date: dayKeySchema });
+export type UsageDay = z.infer<typeof usageDaySchema>;
+
+export const usageDailySchema = z.object({
+  /** Today in the daemon's local calendar; the activity calendar ends on this day. */
+  today: dayKeySchema,
+  /** Days with at least one request in the last DAILY_HISTORY_DAYS days, oldest first. */
+  days: z.array(usageDaySchema),
+  generatedAt: z.string(),
+});
+export type UsageDaily = z.infer<typeof usageDailySchema>;
+
+/** Daily totals for the activity calendar. Filters match stats.usage; the window is always a year. */
+export const usageDailyRpc = defineRpc({
+  name: "stats.daily",
+  input: z
+    .object({
+      scope: statsScopeSchema.optional(),
+      accountId: z.string().min(1).max(40).optional(),
+      model: z.string().min(1).max(120).optional(),
+    })
+    .strict(),
+  output: usageDailySchema,
+});
+
 // ---- API Pricing ---------------------------------------------------------------------------
 
 const rateNumber = z.number().finite().min(0).max(10_000);

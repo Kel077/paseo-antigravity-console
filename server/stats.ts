@@ -1,6 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { StatsRange, StatsScope, UsageStats, UsageTotals } from "../shared/contracts";
+import {
+  DAILY_HISTORY_DAYS,
+  type StatsRange,
+  type StatsScope,
+  type UsageDaily,
+  type UsageStats,
+  type UsageTotals,
+} from "../shared/contracts";
 import {
   estimateRequestCost,
   resolveEffectiveRates,
@@ -162,6 +169,14 @@ export function buildCalendarBins(now: number, range: StatsRange): BinWindow[] {
     const start = currentHour - (count - 1 - index) * binMs;
     return { start, end: start + binMs };
   });
+}
+
+/** "2026-11-23" in the daemon's local calendar. */
+function dayKey(at: number): string {
+  const date = new Date(at);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
 }
 
 function findBinIndex(bins: readonly BinWindow[], at: number): number {
@@ -474,6 +489,51 @@ export class UsageStatsReader {
         .sort((left, right) => right.requests - left.requests),
       conversations: conversationSet.size,
       hasCustomPricing: Object.keys(customPricing).length > 0,
+      generatedAt: new Date(now).toISOString(),
+    };
+  }
+
+  /** Per-day totals over the last DAILY_HISTORY_DAYS local days, for the activity calendar. */
+  async daily(
+    filter: Omit<StatsFilter, "range">,
+    customPricing: Readonly<Record<string, ModelRates>> = {},
+  ): Promise<UsageDaily> {
+    const { scope = "all", accountId, model } = filter;
+    const now = Date.now();
+    const anchor = new Date(now);
+    const firstStart = new Date(
+      anchor.getFullYear(),
+      anchor.getMonth(),
+      anchor.getDate() - (DAILY_HISTORY_DAYS - 1),
+    ).getTime();
+    const tomorrowStart = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + 1).getTime();
+    // The same upper bound summary() uses for its daily range, so both views count the same calls.
+    const lastEnd = Math.max(tomorrowStart, now + 60_000);
+    const days = new Map<string, UsageTotals>();
+
+    for (const record of await this.records()) {
+      if (record.at < firstStart || record.at > lastEnd) continue;
+      if (accountId && record.accountId !== accountId) continue;
+      if (scope === "main" && record.isSubagent) continue;
+      if (scope === "subagent" && !record.isSubagent) continue;
+      if (model && record.label !== model) continue;
+      const rates = resolveEffectiveRates(record.pricingKey, record.at, customPricing);
+      const cost = rates ? estimateRequestCost(record, rates) : null;
+      // A call stamped a little ahead of the clock still belongs to today.
+      const key = dayKey(Math.min(record.at, tomorrowStart - 1));
+      let totals = days.get(key);
+      if (!totals) {
+        totals = emptyTotals();
+        days.set(key, totals);
+      }
+      add(totals, record, cost);
+    }
+
+    return {
+      today: dayKey(now),
+      days: [...days.entries()]
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([date, totals]) => ({ date, ...totals })),
       generatedAt: new Date(now).toISOString(),
     };
   }

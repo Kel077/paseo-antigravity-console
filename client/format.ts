@@ -89,6 +89,24 @@ export function usd(value: number, locale = "en-US"): string {
   return `$${value.toFixed(2)}`;
 }
 
+/** "$113.05", "$0.12", "<$0.01": always two decimals, so a column of costs lines up on the point. */
+export function usdFixed(value: number, locale = "en-US"): string {
+  if (!Number.isFinite(value) || value <= 0) return "$0.00";
+  if (value < 0.005) return "<$0.01";
+  if (typeof Intl !== "undefined" && typeof Intl.NumberFormat === "function") {
+    try {
+      return `$${new Intl.NumberFormat(safeLocale(locale), {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(value)}`;
+    } catch {
+      // Fall through to ASCII grouping.
+    }
+  }
+  const [whole = "0", fraction = "00"] = value.toFixed(2).split(".");
+  return `$${groupThousands(whole)}.${fraction}`;
+}
+
 /** Compact USD formatter for chart Y-axis ticks. */
 export function usdShort(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "$0";
@@ -211,6 +229,73 @@ export function clockTime(timestamp: string | number | Date, locale: string, wit
   }
   const base = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
   return withSeconds ? `${base}:${pad2(date.getSeconds())}` : base;
+}
+
+const EN_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const EN_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const ZH_WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/** Formatters are costly to build and charts format hundreds of dates, so each one is made once. */
+const dateFormatters = new Map<string, Intl.DateTimeFormat | null>();
+
+function dateText(date: Date, locale: string, options: Intl.DateTimeFormatOptions, fallback: () => string): string {
+  if (!Number.isFinite(date.getTime())) return "";
+  const key = `${safeLocale(locale)}|${JSON.stringify(options)}`;
+  let formatter = dateFormatters.get(key);
+  if (formatter === undefined) {
+    formatter = null;
+    if (typeof Intl !== "undefined" && typeof Intl.DateTimeFormat === "function") {
+      try {
+        formatter = new Intl.DateTimeFormat(safeLocale(locale), options);
+      } catch {
+        // Fall back to the built-in names.
+      }
+    }
+    dateFormatters.set(key, formatter);
+  }
+  if (formatter) {
+    try {
+      return formatter.format(date);
+    } catch {
+      // Fall through to the built-in names.
+    }
+  }
+  return fallback();
+}
+
+/** Short month name ("Nov", "11月"). */
+export function monthShort(date: Date, locale: string): string {
+  return dateText(date, locale, { month: "short" }, () =>
+    isChineseLocale(locale) ? `${date.getMonth() + 1}月` : EN_MONTHS[date.getMonth()]!,
+  );
+}
+
+/** Short weekday name ("Mon", "周一"). */
+export function weekdayShort(date: Date, locale: string): string {
+  return dateText(date, locale, { weekday: "short" }, () =>
+    (isChineseLocale(locale) ? ZH_WEEKDAYS : EN_WEEKDAYS)[date.getDay()]!,
+  );
+}
+
+/** Month and day in words ("Nov 23", "11月23日"). */
+export function dayLabel(date: Date, locale: string): string {
+  return dateText(date, locale, { month: "short", day: "numeric" }, () =>
+    isChineseLocale(locale) ? `${date.getMonth() + 1}月${date.getDate()}日` : `${EN_MONTHS[date.getMonth()]} ${date.getDate()}`,
+  );
+}
+
+/** Full date with weekday ("Sun, Nov 23, 2026", "2026年11月23日周日"). */
+export function longDate(date: Date, locale: string): string {
+  return dateText(date, locale, { weekday: "short", year: "numeric", month: "short", day: "numeric" }, () =>
+    isChineseLocale(locale)
+      ? `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日${ZH_WEEKDAYS[date.getDay()]}`
+      : `${EN_WEEKDAYS[date.getDay()]}, ${EN_MONTHS[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`,
+  );
+}
+
+/** Sunday-first weeks in English, Monday-first in Chinese. */
+export function weekStartsOn(locale: string): 0 | 1 {
+  return isChineseLocale(locale) ? 1 : 0;
 }
 
 /** Month/day label ("11/23"), safe across mobile ICU implementations. */
