@@ -54,6 +54,7 @@ export interface StatusUpdateEvent {
   status: AccountSummary["status"];
   quota: QuotaGroup[] | null;
   signedInChanged: boolean;
+  emailChanged?: boolean;
 }
 
 /** Owns the account list, sign-in state, and change notifications. */
@@ -111,22 +112,29 @@ export class AccountService {
   private saveStatuses(): void {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
-      this.saveTimer = null;
-      const body = JSON.stringify(Object.fromEntries(this.runtime), null, 1);
-      const file = statusFile();
-      const seq = ++this.statusWriteSeq;
-      const temp = `${file}.${process.pid}.${Date.now()}.${seq}.tmp`;
-      this.statusWriting = this.statusWriting
-        .then(async () => {
-          await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-          await fs.writeFile(temp, body, { mode: 0o600 });
-          await fs.rename(temp, file);
-        })
-        .catch(async (error: unknown) => {
-          await fs.rm(temp, { force: true }).catch(() => undefined);
-          console.error("antigravity-accounts: could not save statuses", error);
-        });
+      this.flushStatuses();
     }, 1000);
+  }
+
+  private flushStatuses(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    const body = JSON.stringify(Object.fromEntries(this.runtime), null, 1);
+    const file = statusFile();
+    const seq = ++this.statusWriteSeq;
+    const temp = `${file}.${process.pid}.${Date.now()}.${seq}.tmp`;
+    this.statusWriting = this.statusWriting
+      .then(async () => {
+        await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+        await fs.writeFile(temp, body, { mode: 0o600 });
+        await fs.rename(temp, file);
+      })
+      .catch(async (error: unknown) => {
+        await fs.rm(temp, { force: true }).catch(() => undefined);
+        console.error("antigravity-accounts: could not save statuses", error);
+      });
   }
 
   setCooldownProvider(provider: (accountId: string) => AccountCooldown[]): void {
@@ -235,7 +243,9 @@ export class AccountService {
   refreshOne(accountId: string, options?: { forcePlan?: boolean }): Promise<void> {
     const epoch = this.epochOf(accountId);
     const running = this.probing.get(accountId);
-    if (running && running.epoch === epoch && !options?.forcePlan) return running.task;
+    if (running && running.epoch === epoch) {
+      return options?.forcePlan ? running.task.then(() => this.refreshOne(accountId, options)) : running.task;
+    }
     const task = (async () => {
       if (!this.exists(accountId)) return;
       const agy = await this.agy();
@@ -271,7 +281,7 @@ export class AccountService {
         const age = planCheckedAt ? Date.now() - Date.parse(planCheckedAt) : Infinity;
         const shouldCheckPlan =
           otherAccount ||
-          (options?.forcePlan && !plan) ||
+          Boolean(options?.forcePlan) ||
           age > (plan ? PLAN_MAX_AGE_MS : PLAN_RETRY_MS);
         if (shouldCheckPlan) {
           const read = await readPlan(agy, accountId).catch(() => null);
@@ -315,6 +325,7 @@ export class AccountService {
         status: result.kind,
         quota: nextStatus.quota,
         signedInChanged: previous.status !== result.kind,
+        emailChanged: result.kind === "signed-in" && email !== null && email !== knownEmail,
       });
     })()
       .catch((error: unknown) => {
@@ -657,10 +668,11 @@ export class AccountService {
     this.signIns.cancel(loginId);
   }
 
-  dispose(): void {
-    if (this.saveTimer) clearTimeout(this.saveTimer);
+  async dispose(): Promise<void> {
+    if (this.saveTimer) this.flushStatuses();
     this.signIns.cancelAll();
     this.listeners.clear();
     this.statusListeners.clear();
+    await this.statusWriting;
   }
 }
