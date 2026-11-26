@@ -1,7 +1,7 @@
 import { useRpc, useTranslation, type PluginTranslations } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
   usageStatsRpc,
@@ -215,7 +215,7 @@ function SegmentedControl<T extends string>({
 }
 
 /** Columns in the de-emphasis gray with the current bin in the accent. Zero draws nothing. */
-function MiniColumns({ colors, values }: { colors: Colors; values: ReadonlyArray<number | null> }) {
+const MiniColumns = memo(function MiniColumns({ colors, values }: { colors: Colors; values: ReadonlyArray<number | null> }) {
   const peak = Math.max(0, ...values.map((value) => value ?? 0));
   const last = values.length - 1;
   return (
@@ -236,10 +236,10 @@ function MiniColumns({ colors, values }: { colors: Colors; values: ReadonlyArray
       ))}
     </View>
   );
-}
+});
 
 /** A figure that also selects the chart's series; the selected tile carries a heavier accent edge. */
-function StatTile({
+const StatTile = memo(function StatTile({
   colors,
   label,
   value,
@@ -297,7 +297,7 @@ function StatTile({
       <View style={{ height: 26, justifyContent: "flex-end", marginTop: "auto", paddingTop: space.xs }}>{children}</View>
     </Pressable>
   );
-}
+});
 
 function binLabel(start: number, end: number, binMs: number, locale: string): string {
   const day = dayLabel(new Date(start), locale);
@@ -333,7 +333,7 @@ function windowText(stats: UsageStats, locale: string, t: Translate): string {
   return t("stats.windowSince", { start: `${dayLabel(new Date(first.start), locale)} ${clockTime(first.start, locale)}` });
 }
 
-function MetricChart({
+const MetricChart = memo(function MetricChart({
   colors,
   stats,
   metric,
@@ -362,13 +362,29 @@ function MetricChart({
     return Math.max(0, bins.length - 1);
   }, [bins]);
   const selected = hovered !== null && hovered < bins.length ? hovered : lastActive;
-  const rawValues = bins.map((entry) => metricValue(entry, metric));
-  const maxVal = Math.max(0, ...rawValues);
-  const peak = metric === "cache" ? 1 : niceCeiling(maxVal, metric === "firstToken" || metric === "cost");
+  const rawValues = useMemo(() => bins.map((entry) => metricValue(entry, metric)), [bins, metric]);
+  const peak = useMemo(() => {
+    const maxVal = Math.max(0, ...rawValues);
+    return metric === "cache" ? 1 : niceCeiling(maxVal, metric === "firstToken" || metric === "cost");
+  }, [rawValues, metric]);
+  const axisTicks = useMemo(
+    () => [peak, peak / 2, 0].map((tick) => formatAxisTick(tick, metric, locale)),
+    [peak, metric, locale],
+  );
+  const barLabels = useMemo(
+    () =>
+      bins.map(
+        (entry) =>
+          `${binLabel(entry.start, entry.end, stats.binMs, locale)}: ${
+            entry.requests === 0 ? t("stats.noRequests") : metricText(entry, metric, locale, t)
+          }`,
+      ),
+    [bins, stats.binMs, metric, locale, t],
+  );
   const chartHeight = 140;
   const plotTop = 8;
   const plotHeight = chartHeight - plotTop - 4;
-  const topLabel = formatAxisTick(peak, metric, locale);
+  const topLabel = axisTicks[0] ?? "";
   const axisWidth = Math.max(28, topLabel.length * 7.5);
   const bin = bins[selected];
   const periodKey = stats.binMs >= 86_400_000 ? "stats.perDay" : stats.binMs >= 6 * 3_600_000 ? "stats.perSixHours" : "stats.perHour";
@@ -424,7 +440,7 @@ function MetricChart({
 
       <View style={{ flexDirection: "row", gap: space.sm }}>
         <View style={{ width: axisWidth, height: chartHeight }}>
-          {[peak, peak / 2, 0].map((tick, index) => (
+          {axisTicks.map((label, index) => (
             <Text
               key={index}
               style={{
@@ -437,7 +453,7 @@ function MetricChart({
                 lineHeight: 16,
               }}
             >
-              {formatAxisTick(tick, metric, locale)}
+              {label}
             </Text>
           ))}
         </View>
@@ -455,9 +471,7 @@ function MetricChart({
                   <Pressable
                     key={entry.start}
                     accessibilityRole="button"
-                    accessibilityLabel={`${binLabel(entry.start, entry.end, stats.binMs, locale)}: ${
-                      entry.requests === 0 ? t("stats.noRequests") : metricText(entry, metric, locale, t)
-                    }`}
+                    accessibilityLabel={barLabels[index]}
                     onHoverIn={() => {
                       setHovered(index);
                       setPointer(index);
@@ -562,7 +576,7 @@ function MetricChart({
       </View>
     </Card>
   );
-}
+});
 
 type SortKey = "requests" | "tokens" | "cost" | "context" | "output" | "speed" | "cache" | "firstToken";
 type ShareKey = "requests" | "tokens" | "cost";
@@ -594,7 +608,7 @@ function shareValue(figures: ReturnType<typeof derive>, key: ShareKey): number {
   return figures.totalTokens;
 }
 
-function ModelTable({
+const ModelTable = memo(function ModelTable({
   colors,
   stats,
   locale,
@@ -895,9 +909,9 @@ function ModelTable({
       </View>
     </Card>
   );
-}
+});
 
-export function UsageSection({
+export const UsageSection = memo(function UsageSection({
   colors,
   width,
   compact,
@@ -935,8 +949,45 @@ export function UsageSection({
   // The console caps its content at 980 points, so six tiles never fit in one row.
   const columns = width >= 600 ? 3 : 2;
   const tileWidth = Math.floor((width - gap * (columns - 1)) / columns);
-  const totals = stats ? derive(stats.totals) : null;
-  const series = (pick: (bin: UsageTotals) => number | null) => (stats ? stats.bins.map((bin) => pick(bin)) : []);
+  const totals = useMemo(() => (stats ? derive(stats.totals) : null), [stats]);
+  const sparklines = useMemo(() => {
+    if (!stats) {
+      return {
+        tokens: [] as Array<number | null>,
+        cost: [] as Array<number | null>,
+        requests: [] as Array<number | null>,
+        tps: [] as Array<number | null>,
+        firstToken: [] as Array<number | null>,
+      };
+    }
+    const tokensSeries: number[] = [];
+    const costSeries: number[] = [];
+    const requestsSeries: number[] = [];
+    const tpsSeries: Array<number | null> = [];
+    const firstTokenSeries: Array<number | null> = [];
+    for (const bin of stats.bins) {
+      const figures = derive(bin);
+      tokensSeries.push(figures.totalTokens);
+      costSeries.push(bin.cost);
+      requestsSeries.push(bin.requests);
+      tpsSeries.push(figures.tps);
+      firstTokenSeries.push(figures.firstToken);
+    }
+    return {
+      tokens: tokensSeries,
+      cost: costSeries,
+      requests: requestsSeries,
+      tps: tpsSeries,
+      firstToken: firstTokenSeries,
+    };
+  }, [stats]);
+  const handleSelectAccount = useCallback((next: string | null) => {
+    setAccountId(next);
+    setSelectedModel(null);
+  }, []);
+  const handleEditPricing = useCallback((pricingKey: string) => {
+    setPricingOpen({ open: true, focusKey: pricingKey });
+  }, []);
   const hasSubagents = (stats?.breakdown.subagent.requests ?? 0) > 0;
   const accountChips = stats?.accounts ?? [];
   const accountKindById = useMemo(() => new Map(accounts.map((a) => [a.id, a.kind])), [accounts]);
@@ -1113,7 +1164,7 @@ export function UsageSection({
             value={totals ? tokens(totals.totalTokens) : "—"}
             foot={totals ? t("stats.tokensSplit", { input: tokens(totals.prompt), output: tokens(stats!.totals.output) }) : " "}
           >
-            <MiniColumns colors={colors} values={series((bin) => derive(bin).totalTokens)} />
+            <MiniColumns colors={colors} values={sparklines.tokens} />
           </StatTile>
           <StatTile
             {...tile("cost")}
@@ -1128,7 +1179,7 @@ export function UsageSection({
                 : " "
             }
           >
-            <MiniColumns colors={colors} values={series((bin) => bin.cost)} />
+            <MiniColumns colors={colors} values={sparklines.cost} />
           </StatTile>
           <StatTile
             {...tile("requests")}
@@ -1144,7 +1195,7 @@ export function UsageSection({
                 : " "
             }
           >
-            <MiniColumns colors={colors} values={series((bin) => bin.requests)} />
+            <MiniColumns colors={colors} values={sparklines.requests} />
           </StatTile>
           <StatTile
             {...tile("tps")}
@@ -1152,7 +1203,7 @@ export function UsageSection({
             unit="tok/s"
             foot={totals?.output !== null && totals?.output !== undefined ? t("stats.avgOutput", { value: tokens(Math.round(totals.output)) }) : " "}
           >
-            <MiniColumns colors={colors} values={series((bin) => derive(bin).tps)} />
+            <MiniColumns colors={colors} values={sparklines.tps} />
           </StatTile>
           <StatTile
             {...tile("cache")}
@@ -1169,7 +1220,7 @@ export function UsageSection({
             unit="s"
             foot={totals?.context !== null && totals?.context !== undefined ? t("stats.avgContext", { value: tokens(Math.round(totals.context)) }) : " "}
           >
-            <MiniColumns colors={colors} values={series((bin) => derive(bin).firstToken)} />
+            <MiniColumns colors={colors} values={sparklines.firstToken} />
           </StatTile>
         </View>
 
@@ -1189,7 +1240,7 @@ export function UsageSection({
                 wide={width >= 820}
                 selectedModel={selectedModel}
                 onSelectModel={setSelectedModel}
-                onEditPricing={(pricingKey) => setPricingOpen({ open: true, focusKey: pricingKey })}
+                onEditPricing={handleEditPricing}
               />
             ) : null}
           </>
@@ -1201,4 +1252,4 @@ export function UsageSection({
       ) : null}
     </View>
   );
-}
+});

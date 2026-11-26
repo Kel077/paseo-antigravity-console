@@ -9,6 +9,7 @@ import {
 } from "../shared/contracts";
 import {
   extractToolOutput,
+  firstNonEmptyLine,
   formatQuestionEcho,
   normalizeEchoText,
   parseAskQuestions,
@@ -96,6 +97,18 @@ function killedStates(input: unknown, output: unknown): SubagentCheck["states"] 
  */
 export function registerSubagentTransforms(client: PluginClientContext) {
   const knownQuestionEchoes = new Set<string>();
+  const echoFirstLines = new Set<string>();
+  let maxEchoLength = 0;
+
+  function rebuildEchoIndex() {
+    echoFirstLines.clear();
+    maxEchoLength = 0;
+    for (const echo of knownQuestionEchoes) {
+      if (echo.length > maxEchoLength) maxEchoLength = echo.length;
+      const newline = echo.indexOf("\n");
+      echoFirstLines.add(newline < 0 ? echo : echo.slice(0, newline));
+    }
+  }
 
   function rememberEcho(signature: string) {
     if (!signature) return;
@@ -104,7 +117,12 @@ export function registerSubagentTransforms(client: PluginClientContext) {
     if (knownQuestionEchoes.size > MAX_ECHO_CACHE) {
       const oldest = knownQuestionEchoes.keys().next().value;
       if (oldest) knownQuestionEchoes.delete(oldest);
+      rebuildEchoIndex();
+      return;
     }
+    if (signature.length > maxEchoLength) maxEchoLength = signature.length;
+    const newline = signature.indexOf("\n");
+    echoFirstLines.add(newline < 0 ? signature : signature.slice(0, newline));
   }
 
   const removeToolTransform = client.addTimelineTransformer({
@@ -176,6 +194,9 @@ export function registerSubagentTransforms(client: PluginClientContext) {
     query: { itemType: "assistant_message" },
     transform({ item }) {
       if (knownQuestionEchoes.size === 0) return undefined;
+      if (item.text.length > maxEchoLength + 512) return undefined;
+      const { line: firstLine } = firstNonEmptyLine(item.text);
+      if (!firstLine || !echoFirstLines.has(firstLine)) return undefined;
       const normalized = normalizeEchoText(item.text);
       if (normalized && knownQuestionEchoes.has(normalized)) {
         return { items: [] };
@@ -188,5 +209,7 @@ export function registerSubagentTransforms(client: PluginClientContext) {
     removeToolTransform();
     removeEchoTransform();
     knownQuestionEchoes.clear();
+    echoFirstLines.clear();
+    maxEchoLength = 0;
   };
 }
