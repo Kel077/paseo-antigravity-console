@@ -6,12 +6,12 @@ import { z } from "zod";
 import { SYSTEM_ACCOUNT_ID, type QuotaGroup } from "../shared/contracts";
 import { REAL_CLI_DIR, profileCliDir, profileHome } from "./paths";
 
-/** agy 1.5 keeps Google sign-ins in one OS keyring entry unless it believes it runs over SSH. */
+/** Older agy builds select file-backed sign-in in an SSH session. */
 export const FAKE_SSH_CONNECTION = "127.0.0.1 0 127.0.0.1 0";
 
 /**
- * Environment added to an agent session on a profile account. HOME moves agy's data directory and
- * hides the keyring sign-in; SSH_CONNECTION makes agy store its own sign-in in a file inside HOME.
+ * Profile accounts use their own data directory and explicitly select file-backed sign-in.
+ * SSH_CONNECTION also supports older agy builds that select file storage in SSH sessions.
  * ANTIGRAVITY_HOME is ignored by agy, but Paseo's built-in usage source reads it to show the quota
  * of the account the agent runs on.
  */
@@ -20,6 +20,7 @@ export function sessionEnv(accountId: string, current: Readonly<Record<string, s
   return {
     HOME: profileHome(accountId),
     SSH_CONNECTION: current.SSH_CONNECTION || FAKE_SSH_CONNECTION,
+    AGY_CLI_FORCE_FILE_TOKEN_STORAGE: "1",
     ANTIGRAVITY_HOME: profileCliDir(accountId),
   };
 }
