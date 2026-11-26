@@ -1,7 +1,7 @@
 import { useRpc, useTranslation } from "@getpaseo/plugin/client";
 import { Modal, SettingsRow, SettingsSelect, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Text, View } from "react-native";
 import {
   getOrchestratorRpc,
@@ -93,7 +93,7 @@ function missingOn(
 }
 
 /** Planner and executor rows for the console's settings card. */
-export function OrchestratorRows({
+export const OrchestratorRows = memo(function OrchestratorRows({
   colors,
   accounts,
   onChange,
@@ -205,7 +205,7 @@ export function OrchestratorRows({
       ) : null}
     </>
   );
-}
+});
 
 /** Modal to configure an optional per-account Orchestrator override for a profile account. */
 export function AccountOrchestratorDialog({
@@ -241,10 +241,14 @@ export function AccountOrchestratorDialog({
     }
   }, [account.orchestratorOverride, state, mode, planner, executor]);
 
-  const accountPlanners = (state?.planners ?? []).filter((family) => family.accounts.includes(account.id));
-  const accountExecutors = (state?.executors ?? []).filter((family) => family.accounts.includes(account.id));
-  const plannerList = accountPlanners.length ? accountPlanners : (state?.planners ?? []);
-  const executorList = accountExecutors.length ? accountExecutors : (state?.executors ?? []);
+  const plannerList = useMemo(() => {
+    const accountPlanners = (state?.planners ?? []).filter((family) => family.accounts.includes(account.id));
+    return accountPlanners.length ? accountPlanners : (state?.planners ?? []);
+  }, [state?.planners, account.id]);
+  const executorList = useMemo(() => {
+    const accountExecutors = (state?.executors ?? []).filter((family) => family.accounts.includes(account.id));
+    return accountExecutors.length ? accountExecutors : (state?.executors ?? []);
+  }, [state?.executors, account.id]);
 
   async function submit() {
     if (busy) return;
