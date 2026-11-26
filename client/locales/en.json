@@ -146,6 +146,7 @@
   "composerDescription": "{{detail}} · {{status}}",
   "pill": "Antigravity account",
   "pillSignedOut": "Antigravity account (not signed in)",
+  "pillCooling": "Cooling down",
   "manage": "Manage accounts…",
   "now": "Switch now (interrupts the turn)",
   "after": "Switch after this turn",

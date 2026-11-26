@@ -141,6 +141,7 @@
   "composerDescription": "{{detail}} · {{status}}",
   "pill": "Antigravity 账号",
   "pillSignedOut": "Antigravity 账号（未登录）",
+  "pillCooling": "冷却中",
   "manage": "管理账号…",
   "now": "立即切换（会中断当前这一轮）",
   "after": "这一轮结束后切换",
