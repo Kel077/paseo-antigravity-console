@@ -199,7 +199,9 @@ export interface OpenFallback {
 }
 
 export interface HookObservers {
-  onConversationAccount?: (conversationId: string, accountId: string) => void;
+  onConversationTurnStart?: (agentId: string, conversationId: string, accountId: string, startedAt: number) => void;
+  onConversationTurnEnd?: (agentId: string) => void;
+  onConversationTurn?: (conversationId: string, accountId: string, startedAt: number, endedAt: number) => Promise<void>;
   onAgentArchived?: (agentId: string) => void;
 }
 
@@ -211,6 +213,7 @@ export function registerHooks(
   observers?: HookObservers,
 ): Array<() => void> {
   const removers: Array<() => void> = [];
+  const activeTurns = new Map<string, { turnId: string | null; accountId: string; startedAt: number }>();
 
   // New Antigravity agents get the default account (or best fallback when configured & default is unavailable).
   removers.push(
@@ -296,23 +299,38 @@ export function registerHooks(
     }),
   );
 
-  // A finished turn used quota: re-read that account's quota shortly after and record attribution.
+  removers.push(
+    server.addHook("agent.turn.before", async ({ agent, turnId }, { paseo }) => {
+      if (!isAntigravityProvider(agent.provider)) return;
+      const accountId = accountIdFromMetadata(agent.metadata);
+      const startedAt = Date.now();
+      const entry = { turnId, accountId, startedAt };
+      activeTurns.set(agent.id, entry);
+      if (observers?.onConversationTurnStart) {
+        const snapshot = await paseo.agents.ref(agent.id).refresh().catch(() => null);
+        const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+        if (conversationId && activeTurns.get(agent.id) === entry) {
+          observers.onConversationTurnStart(agent.id, conversationId, accountId, startedAt);
+        }
+      }
+    }),
+  );
+
+  // Attribute only the observed turn, using the account selected when the turn began.
   const quotaRefresh = new Map<string, NodeJS.Timeout>();
   removers.push(
-    server.addHook("agent.turn.after", async ({ agent }, { paseo }) => {
+    server.addHook("agent.turn.after", async ({ agent, turnId }, { paseo }) => {
       if (!isAntigravityProvider(agent.provider)) return;
-      await service.init();
-      const accountId = accountIdFromMetadata(agent.metadata);
-      if (observers?.onConversationAccount) {
-        void paseo.agents
-          .ref(agent.id)
-          .refresh()
-          .then((snapshot) => {
-            const conversationId = conversationIdFrom(snapshot?.agent.persistence);
-            if (conversationId) observers.onConversationAccount?.(conversationId, accountId);
-          })
-          .catch(() => undefined);
+      const endedAt = Date.now();
+      const active = activeTurns.get(agent.id);
+      const turn =
+        active && (active.turnId === turnId || active.turnId === null || turnId === null) ? active : undefined;
+      if (turn) {
+        activeTurns.delete(agent.id);
+        observers?.onConversationTurnEnd?.(agent.id);
       }
+      const accountId = turn?.accountId ?? accountIdFromMetadata(agent.metadata);
+      await service.init();
       clearTimeout(quotaRefresh.get(accountId));
       quotaRefresh.set(
         accountId,
@@ -321,6 +339,13 @@ export function registerHooks(
           void service.refreshOne(accountId).catch(() => undefined);
         }, 15_000),
       );
+      if (turn && observers?.onConversationTurn) {
+        const snapshot = await paseo.agents.ref(agent.id).refresh().catch(() => null);
+        const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+        if (conversationId) {
+          await observers.onConversationTurn(conversationId, accountId, turn.startedAt, endedAt);
+        }
+      }
     }),
   );
   removers.push(() => {
@@ -347,8 +372,29 @@ export function registerHooks(
   );
 
   removers.push(
+    server.addHook("agent.close.after", async ({ agent }, { paseo }) => {
+      if (!isAntigravityProvider(agent.provider)) return;
+      const active = activeTurns.get(agent.id);
+      if (active) {
+        const endedAt = Date.now();
+        activeTurns.delete(agent.id);
+        observers?.onConversationTurnEnd?.(agent.id);
+        if (observers?.onConversationTurn) {
+          const snapshot = await paseo.agents.ref(agent.id).refresh().catch(() => null);
+          const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+          if (conversationId) {
+            await observers.onConversationTurn(conversationId, active.accountId, active.startedAt, endedAt);
+          }
+        }
+      }
+    }),
+  );
+
+  removers.push(
     server.addHook("agent.archive.after", async ({ agent }) => {
       pending.delete(agent.id);
+      activeTurns.delete(agent.id);
+      observers?.onConversationTurnEnd?.(agent.id);
       observers?.onAgentArchived?.(agent.id);
     }),
   );

@@ -13,6 +13,9 @@ export const ACCOUNT_METADATA_KEY = "antigravity-accounts.account";
 /** Id of the system sign-in (the keychain login `agy` uses without this plugin). */
 export const SYSTEM_ACCOUNT_ID = "default";
 
+/** Synthetic account id used in usage analytics for requests without an observed account turn. */
+export const UNATTRIBUTED_ACCOUNT_ID = "unattributed";
+
 /** True when a provider string (`antigravity` or `antigravity/<model>`) is Antigravity. */
 export function isAntigravityProvider(provider: string | null | undefined): boolean {
   if (!provider) return false;
