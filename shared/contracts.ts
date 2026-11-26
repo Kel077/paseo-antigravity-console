@@ -566,7 +566,8 @@ export type FallbackEvent = z.infer<typeof fallbackEventSchema>;
 
 /** Antigravity model ids that run the Orchestrator (a planner that hands work to an executor). */
 export function isOrchestratorModel(model: string | null | undefined): boolean {
-  return typeof model === "string" && model.startsWith("gemini-pro-orchestrator");
+  if (typeof model !== "string") return false;
+  return model.trim().toLowerCase().replace(/^antigravity\//, "").startsWith("gemini-pro-orchestrator");
 }
 
 export const modelVariantSchema = z.object({
