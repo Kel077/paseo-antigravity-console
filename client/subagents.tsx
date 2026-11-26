@@ -827,7 +827,16 @@ function Detail({
     <ScrollView ref={scrollRef} style={{ flex: 1 }} contentContainerStyle={{ padding: pad, gap: space.xl }}>
       <View style={{ gap: space.sm }}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm, flexWrap: "wrap" }}>
-          <Text style={{ ...font.title, color: colors.foreground }}>{summary.role ?? summary.type ?? summary.id.slice(0, 8)}</Text>
+          <Text
+            style={{
+              ...font.title,
+              fontSize: compact ? 18 : font.title.fontSize,
+              color: colors.foreground,
+              flexShrink: 1,
+            }}
+          >
+            {summary.role ?? summary.type ?? summary.id.slice(0, 8)}
+          </Text>
           {summary.type && summary.role ? <Badge colors={colors} label={summary.type} /> : null}
           <Badge colors={colors} label={t(`subagents.state.${summary.state}`)} tone={STATE_TONE[summary.state]} dot />
           <View style={{ flex: 1 }} />

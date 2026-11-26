@@ -1,7 +1,7 @@
 import { useRpc, useTranslation, type PluginTranslations } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
   usageStatsRpc,
@@ -246,6 +246,7 @@ function StatTile({
   unit,
   foot,
   width,
+  compact = false,
   selected,
   onPress,
   children,
@@ -256,11 +257,13 @@ function StatTile({
   unit?: string;
   foot: string;
   width: number | "100%";
+  compact?: boolean;
   selected: boolean;
   onPress(): void;
   children: ReactNode;
 }) {
   const edge = selected ? 2 : 1;
+  const pad = (compact ? space.md : space.lg) - edge + 1;
   return (
     <Pressable
       accessibilityRole="tab"
@@ -269,7 +272,7 @@ function StatTile({
       onPress={onPress}
       style={(state) => ({
         width,
-        padding: space.lg - edge + 1,
+        padding: pad,
         gap: space.xs,
         borderRadius: radius.lg,
         borderWidth: edge,
@@ -286,7 +289,16 @@ function StatTile({
       </Text>
       <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.xs }}>
         {/* Proportional figures: tabular digits look loose at display sizes. */}
-        <Text numberOfLines={1} style={{ fontSize: 26, lineHeight: 32, fontWeight: "600", color: colors.foreground }}>
+        <Text
+          numberOfLines={1}
+          style={{
+            fontSize: compact ? 22 : 26,
+            lineHeight: compact ? 28 : 32,
+            fontWeight: "600",
+            color: colors.foreground,
+            flexShrink: 1,
+          }}
+        >
           {value}
         </Text>
         {unit ? <Text style={{ ...font.small, color: colors.foregroundMuted }}>{unit}</Text> : null}
@@ -314,12 +326,15 @@ function tickLabel(start: number, binMs: number, locale: string): string {
   return clockTime(start, locale);
 }
 
-function showsTick(start: number, binMs: number, index: number, total: number): boolean {
-  if (index === 0 || index === total - 1) return false;
+function showsTick(start: number, binMs: number, index: number, total: number, narrow: boolean): boolean {
+  if (index <= 1 || index >= total - 2) return false;
   const date = new Date(start);
-  if (binMs >= 86_400_000) return index % 5 === 0;
-  if (binMs >= 6 * 3_600_000) return date.getHours() === 0;
-  return date.getHours() % 6 === 0;
+  if (binMs >= 86_400_000) return index % (narrow ? 8 : 5) === 0;
+  if (binMs >= 6 * 3_600_000) {
+    if (date.getHours() !== 0) return false;
+    return !narrow || Math.floor(index / 4) % 2 === 1;
+  }
+  return date.getHours() % (narrow ? 8 : 6) === 0;
 }
 
 /** "Nov 23 00:00 – now" for hourly ranges, "Oct 25 – Nov 23" for days: the window the range covers. */
@@ -350,9 +365,11 @@ function MetricChart({
   const [hovered, setHovered] = useState<number | null>(null);
   const [pointer, setPointer] = useState<number | null>(null);
   const [plotWidth, setPlotWidth] = useState(0);
+  const hoverPointer = useRef(false);
   const bins = stats.bins;
 
   useEffect(() => {
+    hoverPointer.current = false;
     setHovered(null);
     setPointer(null);
   }, [stats.range, bins.length]);
@@ -396,14 +413,25 @@ function MetricChart({
           : centered;
 
   return (
-    <Card colors={colors} style={{ padding: space.lg, gap: space.md }}>
-      <View
-        style={{
-          flexDirection: compact ? "column" : "row",
-          alignItems: compact ? "flex-start" : "baseline",
-          gap: compact ? 2 : space.md,
+    <Card colors={colors} style={{ padding: space.lg }}>
+      <Pressable
+        accessible={false}
+        focusable={false}
+        onPress={() => {
+          if (!hoverPointer.current) {
+            setHovered(null);
+            setPointer(null);
+          }
         }}
+        style={{ gap: space.md }}
       >
+        <View
+          style={{
+            flexDirection: compact ? "column" : "row",
+            alignItems: compact ? "flex-start" : "baseline",
+            gap: compact ? 2 : space.md,
+          }}
+        >
         <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, flex: compact ? undefined : 1, minWidth: 0 }}>
           <Text numberOfLines={1} style={{ ...font.heading, color: colors.foreground, flexShrink: 1 }}>
             {t(METRIC_LABEL[metric])}
@@ -459,14 +487,25 @@ function MetricChart({
                       entry.requests === 0 ? t("stats.noRequests") : metricText(entry, metric, locale, t)
                     }`}
                     onHoverIn={() => {
+                      hoverPointer.current = true;
                       setHovered(index);
                       setPointer(index);
                     }}
                     onHoverOut={() => {
+                      hoverPointer.current = false;
                       setHovered((current) => (current === index ? null : current));
                       setPointer((current) => (current === index ? null : current));
                     }}
-                    onPressIn={() => setHovered(index)}
+                    onPress={(event) => {
+                      event.stopPropagation?.();
+                      if (hoverPointer.current) {
+                        setHovered(index);
+                        setPointer(index);
+                        return;
+                      }
+                      setHovered((current) => (current === index ? null : index));
+                      setPointer((current) => (current === index ? null : index));
+                    }}
                     style={(state) => ({
                       flex: 1,
                       height: "100%",
@@ -496,9 +535,9 @@ function MetricChart({
           <View style={{ flexDirection: "row", marginTop: space.xs, height: 16 }}>
             {bins.map((entry, index) => (
               <View key={entry.start} style={{ flex: 1, alignItems: "center" }}>
-                {showsTick(entry.start, stats.binMs, index, bins.length) ? (
-                  <View pointerEvents="none" style={{ position: "absolute", width: 72, alignItems: "center" }}>
-                    <Text style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
+                {showsTick(entry.start, stats.binMs, index, bins.length, compact || (plotWidth > 0 && plotWidth < 420)) ? (
+                  <View pointerEvents="none" style={{ position: "absolute", width: 76, alignItems: "center" }}>
+                    <Text numberOfLines={1} style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}>
                       {tickLabel(entry.start, stats.binMs, locale)}
                     </Text>
                   </View>
@@ -511,6 +550,7 @@ function MetricChart({
                 pointerEvents="none"
                 style={{
                   position: "absolute",
+                  zIndex: 10,
                   top: 0,
                   left: tooltipLeft,
                   width: tooltipWidth,
@@ -560,6 +600,7 @@ function MetricChart({
             ) : null}
         </View>
       </View>
+      </Pressable>
     </Card>
   );
 }
@@ -710,8 +751,8 @@ function ModelTable({
 
   return (
     <Card colors={colors} style={{ padding: space.lg, gap: space.sm }}>
-      <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, marginBottom: space.xs }}>
-        <Text style={{ ...font.heading, color: colors.foreground, flex: 1 }}>{t("stats.models")}</Text>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "baseline", columnGap: space.sm, rowGap: 2, marginBottom: space.xs }}>
+        <Text style={{ ...font.heading, color: colors.foreground, flexGrow: 1 }}>{t("stats.models")}</Text>
         <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{t("stats.modelsHint")}</Text>
       </View>
 
@@ -818,7 +859,12 @@ function ModelTable({
                     <Muted colors={colors} small>
                       {t("stats.readoutRequests", { count: figures.requests, value: integer(figures.requests, locale) })}
                     </Muted>
-                    {costCell(model.pricingKey, model.label, cells.cost, figures.cost === null)}
+                    {costCell(
+                      model.pricingKey,
+                      model.label,
+                      figures.cost === null ? t("pricing.unpriced") : cells.cost,
+                      figures.cost === null,
+                    )}
                     <Muted colors={colors} small>
                       {[
                         `${t("stats.col.context")} ${cells.context}`,
@@ -885,7 +931,10 @@ function ModelTable({
                     </Text>
                   </View>
                   <Muted colors={colors} small>
-                    {[t("stats.readoutRequests", { count: totals.requests, value: integer(totals.requests, locale) }), cells.cost, cells.speed, `${t("stats.col.cache")} ${cells.cache}`].join(" · ")}
+                    {(totals.requests === 0
+                      ? [t("stats.readoutRequests", { count: 0, value: integer(0, locale) })]
+                      : [t("stats.readoutRequests", { count: totals.requests, value: integer(totals.requests, locale) }), cells.cost, cells.speed, `${t("stats.col.cache")} ${cells.cache}`]
+                    ).join(" · ")}
                   </Muted>
                 </>
               );
@@ -944,6 +993,7 @@ export function UsageSection({
   const tile = (key: ChartMetric) => ({
     colors,
     width: tileWidth,
+    compact,
     label: t(METRIC_LABEL[key]),
     selected: metric === key,
     onPress: () => setMetric(key),
