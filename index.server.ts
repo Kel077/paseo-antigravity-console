@@ -73,7 +73,11 @@ export default function contribute(server: PluginServerContext) {
 
   const fallback = new FallbackController(service, pending, orchestrator);
   const removers = registerHooks(server, service, pending, fallback, {
-    onConversationAccount: (conversationId, accountId) => stats.recordConversationAccount(conversationId, accountId),
+    onConversationTurnStart: (agentId, conversationId, accountId, startedAt) =>
+      stats.beginConversationTurn(agentId, conversationId, accountId, startedAt),
+    onConversationTurnEnd: (agentId) => stats.endConversationTurn(agentId),
+    onConversationTurn: (conversationId, accountId, startedAt, endedAt) =>
+      stats.recordConversationTurn(conversationId, accountId, startedAt, endedAt),
     onAgentArchived: (agentId) => {
       context.forget(agentId);
       subagents.forget(agentId);
@@ -264,13 +268,13 @@ export default function contribute(server: PluginServerContext) {
     void ready.then(() => push({ revision: service.currentRevision() })).catch(() => undefined);
   });
 
-  return () => {
+  return async () => {
     clearTimeout(warmup);
     clearInterval(quotaTimer);
     clearInterval(sweepTimer);
     for (const remove of removers) remove();
     fallback.dispose();
-    stats.dispose();
     service.dispose();
+    await stats.dispose();
   };
 }
