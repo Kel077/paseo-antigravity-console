@@ -211,6 +211,16 @@ export function registerHooks(
   observers?: HookObservers,
 ): Array<() => void> {
   const removers: Array<() => void> = [];
+  const agentConversations = new Map<string, string>();
+
+  async function resolveConversationId(paseo: PaseoApi, agentId: string): Promise<string | null> {
+    const cached = agentConversations.get(agentId);
+    if (cached) return cached;
+    const snapshot = await paseo.agents.ref(agentId).refresh().catch(() => null);
+    const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+    if (conversationId) agentConversations.set(agentId, conversationId);
+    return conversationId;
+  }
 
   // New Antigravity agents get the default account (or best fallback when configured & default is unavailable).
   removers.push(
@@ -304,11 +314,8 @@ export function registerHooks(
       await service.init();
       const accountId = accountIdFromMetadata(agent.metadata);
       if (observers?.onConversationAccount) {
-        void paseo.agents
-          .ref(agent.id)
-          .refresh()
-          .then((snapshot) => {
-            const conversationId = conversationIdFrom(snapshot?.agent.persistence);
+        void resolveConversationId(paseo, agent.id)
+          .then((conversationId) => {
             if (conversationId) observers.onConversationAccount?.(conversationId, accountId);
           })
           .catch(() => undefined);
@@ -326,6 +333,7 @@ export function registerHooks(
   removers.push(() => {
     for (const timer of quotaRefresh.values()) clearTimeout(timer);
     quotaRefresh.clear();
+    agentConversations.clear();
   });
 
   // Deferred switches run as soon as the agent's turn ends.
@@ -347,8 +355,16 @@ export function registerHooks(
   );
 
   removers.push(
+    server.addHook("agent.close.after", async ({ agent }) => {
+      if (!isAntigravityProvider(agent.provider)) return;
+      agentConversations.delete(agent.id);
+    }),
+  );
+
+  removers.push(
     server.addHook("agent.archive.after", async ({ agent }) => {
       pending.delete(agent.id);
+      agentConversations.delete(agent.id);
       observers?.onAgentArchived?.(agent.id);
     }),
   );

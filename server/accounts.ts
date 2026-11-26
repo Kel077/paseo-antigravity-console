@@ -48,6 +48,20 @@ const UNKNOWN: RuntimeStatus = {
 /** Plans rarely change: ask again after this long, or sooner while none is known. */
 const PLAN_MAX_AGE_MS = 6 * 60 * 60_000;
 const PLAN_RETRY_MS = 30 * 60_000;
+const REFRESH_CONCURRENCY = 3;
+const CHANGE_DEBOUNCE_MS = 100;
+
+async function runPool<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      await fn(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+}
 
 export interface StatusUpdateEvent {
   accountId: string;
@@ -74,6 +88,10 @@ export class AccountService {
 
   private initialized: Promise<void> | null = null;
   private saveTimer: NodeJS.Timeout | null = null;
+  private statusDirty = false;
+  private notifyTimer: NodeJS.Timeout | null = null;
+  private batchDepth = 0;
+  private pendingNotify = false;
   private statusWriting: Promise<void> = Promise.resolve();
   private statusWriteSeq = 0;
 
@@ -108,10 +126,23 @@ export class AccountService {
     return accountId === SYSTEM_ACCOUNT_ID || Boolean(this.store.get(accountId));
   }
 
+  private setRuntime(accountId: string, status: RuntimeStatus): void {
+    this.runtime.set(accountId, status);
+    this.statusDirty = true;
+  }
+
+  private deleteRuntime(accountId: string): void {
+    if (this.runtime.delete(accountId)) {
+      this.statusDirty = true;
+    }
+  }
+
   private saveStatuses(): void {
-    if (this.saveTimer) return;
+    if (!this.statusDirty || this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
+      if (!this.statusDirty) return;
+      this.statusDirty = false;
       const body = JSON.stringify(Object.fromEntries(this.runtime), null, 1);
       const file = statusFile();
       const seq = ++this.statusWriteSeq;
@@ -152,9 +183,12 @@ export class AccountService {
     this.changed();
   }
 
-  private changed(): void {
-    this.revision += 1;
-    this.saveStatuses();
+  private emitRevision(): void {
+    if (this.notifyTimer) {
+      clearTimeout(this.notifyTimer);
+      this.notifyTimer = null;
+    }
+    this.pendingNotify = false;
     for (const listener of this.listeners) {
       try {
         listener(this.revision);
@@ -162,6 +196,19 @@ export class AccountService {
         console.error("antigravity-accounts: change listener failed", error);
       }
     }
+  }
+
+  private changed(): void {
+    this.revision += 1;
+    this.saveStatuses();
+    if (this.batchDepth > 0) {
+      this.pendingNotify = true;
+      return;
+    }
+    if (this.notifyTimer) return;
+    this.notifyTimer = setTimeout(() => {
+      this.emitRevision();
+    }, CHANGE_DEBOUNCE_MS);
   }
 
   private emitStatus(event: StatusUpdateEvent): void {
@@ -207,7 +254,7 @@ export class AccountService {
   }
 
   labelOf(accountId: string): string {
-    if (accountId === SYSTEM_ACCOUNT_ID) return this.store.snapshot().systemLabel;
+    if (accountId === SYSTEM_ACCOUNT_ID) return this.store.readonlyData().systemLabel;
     return this.store.get(accountId)?.label ?? accountId;
   }
 
@@ -221,7 +268,7 @@ export class AccountService {
 
   /** Re-syncs settings.json into every existing profile (e.g. after global Orchestrator settings change). */
   async syncAllProfiles(): Promise<void> {
-    const accounts = this.store.snapshot().accounts;
+    const accounts = this.store.readonlyData().accounts;
     await Promise.all(
       accounts.map((account) =>
         ensureProfile(account.id, account.orchestrator).catch((error: unknown) => {
@@ -243,7 +290,7 @@ export class AccountService {
       const previous = this.runtime.get(accountId) ?? UNKNOWN;
       if (!agy) {
         if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
-        this.runtime.set(accountId, {
+        this.setRuntime(accountId, {
           ...previous,
           status: "error",
           statusDetail: "agy was not found on this host",
@@ -260,7 +307,7 @@ export class AccountService {
       if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
       const email = result.kind === "signed-in" ? await readAccountEmail(accountId) : null;
       const knownEmail =
-        accountId === SYSTEM_ACCOUNT_ID ? this.store.snapshot().systemEmail : (this.store.get(accountId)?.email ?? null);
+        accountId === SYSTEM_ACCOUNT_ID ? this.store.readonlyData().systemEmail : (this.store.get(accountId)?.email ?? null);
       let { plan, planCheckedAt } = previous;
       if (result.kind === "signed-out") {
         plan = null;
@@ -295,7 +342,7 @@ export class AccountService {
         plan,
         planCheckedAt,
       };
-      this.runtime.set(accountId, nextStatus);
+      this.setRuntime(accountId, nextStatus);
       if (result.kind === "signed-in" && email && email !== knownEmail) {
         await this.store.update((data) => {
           if (accountId === SYSTEM_ACCOUNT_ID) data.systemEmail = email;
@@ -319,7 +366,7 @@ export class AccountService {
     })()
       .catch((error: unknown) => {
         if (!this.exists(accountId) || this.epochOf(accountId) !== epoch) return;
-        this.runtime.set(accountId, {
+        this.setRuntime(accountId, {
           ...(this.runtime.get(accountId) ?? UNKNOWN),
           status: "error",
           statusDetail: error instanceof Error ? error.message : String(error),
@@ -337,8 +384,16 @@ export class AccountService {
 
   async refreshAll(options?: { forcePlan?: boolean }): Promise<void> {
     await this.agy(true);
-    const ids = orderedAccountIds(this.store.snapshot());
-    await Promise.all(ids.map((id) => this.refreshOne(id, options)));
+    const ids = orderedAccountIds(this.store.readonlyData());
+    this.batchDepth += 1;
+    try {
+      await runPool(ids, REFRESH_CONCURRENCY, (id) => this.refreshOne(id, options));
+    } finally {
+      this.batchDepth = Math.max(0, this.batchDepth - 1);
+      if (this.batchDepth === 0 && this.pendingNotify) {
+        this.emitRevision();
+      }
+    }
   }
 
   /** Last known status without probing. */
@@ -356,7 +411,7 @@ export class AccountService {
 
   async state(): Promise<AccountsState> {
     const agy = await this.agy();
-    const data = this.store.snapshot();
+    const data = this.store.readonlyData();
     const problems: string[] = [];
     if (!agy) problems.push("agy was not found on this host. Install the Antigravity CLI, then refresh.");
     const defaultExists =
@@ -415,13 +470,13 @@ export class AccountService {
       agyPath: agy,
       agyVersion: this.agyVersionValue,
       problems,
-      fallback: data.fallback,
+      fallback: { ...data.fallback },
       revision: this.revision,
     };
   }
 
   fallbackSettings(): FallbackSettings {
-    return this.store.snapshot().fallback;
+    return { ...this.store.readonlyData().fallback };
   }
 
   async setFallback(patch: Partial<FallbackSettings>): Promise<void> {
@@ -465,7 +520,7 @@ export class AccountService {
       data.order = order;
     });
     await this.ensureAccountProfile(id);
-    this.runtime.set(id, { ...UNKNOWN, status: "signed-out", statusDetail: "Not signed in yet" });
+    this.setRuntime(id, { ...UNKNOWN, status: "signed-out", statusDetail: "Not signed in yet" });
     this.changed();
     const created = (await this.state()).accounts.find((account) => account.id === id);
     if (!created) throw new Error("The new account could not be read back.");
@@ -567,7 +622,7 @@ export class AccountService {
       data.order = data.order.filter((id) => id !== accountId);
       if (data.defaultAccountId === accountId) data.defaultAccountId = SYSTEM_ACCOUNT_ID;
     });
-    this.runtime.delete(accountId);
+    this.deleteRuntime(accountId);
     this.changed();
     return preserved ? { items: preserved.items, folder: displayPath(preserved.folder) } : null;
   }
@@ -585,7 +640,7 @@ export class AccountService {
         entry.unsafeDetail = null;
       }
     });
-    this.runtime.set(accountId, { ...UNKNOWN, status: "signed-out", statusDetail: "Signed out" });
+    this.setRuntime(accountId, { ...UNKNOWN, status: "signed-out", statusDetail: "Signed out" });
     this.emitStatus({ accountId, status: "signed-out", quota: null, signedInChanged: true });
     this.changed();
     await this.refreshOne(accountId);
@@ -602,7 +657,7 @@ export class AccountService {
   async submitSignIn(loginId: string, code: string): Promise<void> {
     const accountId = this.signIns.accountOf(loginId);
     if (!accountId) throw new Error("This sign-in expired or was cancelled. Start again.");
-    const systemEmailBefore = this.store.snapshot().systemEmail;
+    const systemEmailBefore = this.store.readonlyData().systemEmail;
     const outcome = await this.signIns.submit(loginId, code);
     const scan = await scanAfterSignIn(accountId, outcome.submittedAt);
     this.bumpEpoch(accountId);
@@ -625,7 +680,7 @@ export class AccountService {
     // A sign-in that changed the system account's identity means the keyring was written.
     if (status?.status === "signed-in" && systemEmailBefore) {
       await this.refreshOne(SYSTEM_ACCOUNT_ID);
-      const systemEmailAfter = this.store.snapshot().systemEmail;
+      const systemEmailAfter = this.store.readonlyData().systemEmail;
       const accountEmail = this.store.get(accountId)?.email ?? null;
       if (
         accountEmail &&
@@ -658,6 +713,11 @@ export class AccountService {
   }
 
   dispose(): void {
+    if (this.notifyTimer) {
+      clearTimeout(this.notifyTimer);
+      this.notifyTimer = null;
+    }
+    this.pendingNotify = false;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.signIns.cancelAll();
     this.listeners.clear();

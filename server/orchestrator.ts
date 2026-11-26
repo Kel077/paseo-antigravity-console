@@ -11,7 +11,7 @@ import {
 } from "../shared/contracts";
 import type { AccountService } from "./accounts";
 import { NEEDS_SIGN_IN, commandEnv, runAgy } from "./agy";
-import { REAL_CLI_DIR, REAL_SETTINGS_FILE, paseoHome, profileHome, resolveAgy } from "./paths";
+import { REAL_CLI_DIR, REAL_SETTINGS_FILE, paseoHome, profileHome } from "./paths";
 import type { PaseoApi } from "./types";
 
 /**
@@ -44,6 +44,19 @@ interface Catalog {
 
 /** After a failed `agy models`, wait this long before trying the account again. */
 const FAILURE_BACKOFF_MS = 2 * 60_000;
+const CATALOG_CONCURRENCY = 3;
+
+async function runPool<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      await fn(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+}
 
 type SettingsJson = Record<string, unknown> & { orchestrator?: Record<string, unknown> };
 
@@ -177,7 +190,7 @@ export class OrchestratorSettings {
     const inflight = this.fetching.get(accountId);
     if (inflight) return inflight;
     const task = (async () => {
-      const agy = await resolveAgy();
+      const agy = await this.service.agy();
       if (!agy) throw new Error("Antigravity CLI (agy) was not found.");
       if (accountId !== SYSTEM_ACCOUNT_ID) await this.service.ensureAccountProfile(accountId);
       const result = await runAgy(agy, ["models"], {
@@ -207,16 +220,14 @@ export class OrchestratorSettings {
     const accounts = accountState.accounts.filter((account) => account.usable && account.status !== "signed-out");
     const catalogs = new Map<string, CatalogModel[]>();
     let error: string | null = null;
-    await Promise.all(
-      accounts.map(async (account) => {
-        try {
-          const models = await this.catalog(account.id, account.email ?? "", refresh);
-          if (models) catalogs.set(account.id, models);
-        } catch (failure) {
-          error = failure instanceof Error ? failure.message : String(failure);
-        }
-      }),
-    );
+    await runPool(accounts, CATALOG_CONCURRENCY, async (account) => {
+      try {
+        const models = await this.catalog(account.id, account.email ?? "", refresh);
+        if (models) catalogs.set(account.id, models);
+      } catch (failure) {
+        error = failure instanceof Error ? failure.message : String(failure);
+      }
+    });
     // Keep configured account order, with the system sign-in first when present.
     const ordered = new Map(
       [...catalogs].sort(
