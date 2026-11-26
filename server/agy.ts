@@ -66,13 +66,20 @@ export function runAgy(
     let stderr = "";
     let timedOut = false;
     let stopped = false;
+    let killTimer: NodeJS.Timeout | undefined;
     const cap = 4 * 1024 * 1024;
+    const terminate = () => {
+      child.kill("SIGTERM");
+      if (!killTimer) {
+        killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
+        killTimer.unref();
+      }
+    };
     const check = () => {
       if (stopped || !options.stopWhen) return;
       if (options.stopWhen.test(stdout) || options.stopWhen.test(stderr)) {
         stopped = true;
-        child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+        terminate();
       }
     };
     child.stdout.on("data", (chunk: Buffer) => {
@@ -85,15 +92,16 @@ export function runAgy(
     });
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+      terminate();
     }, options.timeoutMs);
     child.on("error", (error) => {
       clearTimeout(timer);
+      clearTimeout(killTimer);
       resolve({ code: null, stdout, stderr: `${stderr}${error.message}`, timedOut, stopped });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      clearTimeout(killTimer);
       resolve({ code, stdout, stderr, timedOut, stopped });
     });
   });
@@ -242,16 +250,23 @@ export function readPlan(agyPath: string, accountId: string): Promise<AccountPla
       detached: false,
     });
     let settled = false;
+    let exited = false;
     let stdout = "";
     let stderr = "";
+    let killTimer: NodeJS.Timeout | undefined;
     const timer = setTimeout(() => finish(null), PLAN_TIMEOUT_MS);
     function finish(plan: AccountPlan | null) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       child.stdin.destroy();
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+      if (!exited) {
+        child.kill("SIGTERM");
+        if (!killTimer) {
+          killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
+          killTimer.unref();
+        }
+      }
       resolve(plan);
     }
     function send(id: number, method: string, params: unknown) {
@@ -270,8 +285,16 @@ export function readPlan(agyPath: string, accountId: string): Promise<AccountPla
         finish(auth.success ? auth.data._meta.antigravity.tier : null);
       }
     }
-    child.on("error", () => finish(null));
-    child.on("close", () => finish(null));
+    child.on("error", () => {
+      exited = true;
+      clearTimeout(killTimer);
+      finish(null);
+    });
+    child.on("close", () => {
+      exited = true;
+      clearTimeout(killTimer);
+      finish(null);
+    });
     child.stdin.on("error", () => finish(null));
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length < 64 * 1024) stderr += chunk.toString("utf8");
@@ -299,6 +322,11 @@ export function readPlan(agyPath: string, accountId: string): Promise<AccountPla
 
 const EMAIL_LINE = /authenticated successfully as (\S+@\S+)/g;
 
+const emailCache = new Map<
+  string,
+  { newestFile: string; newestMtime: number; newestSize: number; email: string | null }
+>();
+
 /** The Google account agy last reported for this account, from its own logs. */
 export async function readAccountEmail(accountId: string): Promise<string | null> {
   const logDir = path.join(
@@ -309,6 +337,7 @@ export async function readAccountEmail(accountId: string): Promise<string | null
   try {
     names = await fs.readdir(logDir);
   } catch {
+    emailCache.delete(logDir);
     return null;
   }
   const files = await Promise.all(
@@ -317,18 +346,42 @@ export async function readAccountEmail(accountId: string): Promise<string | null
       .map(async (name) => {
         const full = path.join(logDir, name);
         const stat = await fs.stat(full).catch(() => null);
-        return stat?.isFile() ? { full, mtime: stat.mtimeMs } : null;
+        return stat?.isFile() ? { full, mtime: stat.mtimeMs, size: stat.size } : null;
       }),
   );
   const recent = files
-    .filter((file): file is { full: string; mtime: number } => file !== null)
+    .filter((file): file is { full: string; mtime: number; size: number } => file !== null)
     .sort((left, right) => right.mtime - left.mtime)
     .slice(0, 25);
+  const newest = recent[0];
+  if (!newest) {
+    emailCache.delete(logDir);
+    return null;
+  }
+  const cached = emailCache.get(logDir);
+  if (
+    cached &&
+    cached.newestFile === newest.full &&
+    cached.newestMtime === newest.mtime &&
+    cached.newestSize === newest.size
+  ) {
+    return cached.email;
+  }
+  let email: string | null = null;
   for (const file of recent) {
     const text = await fs.readFile(file.full, "utf8").catch(() => "");
     let last: string | null = null;
     for (const match of text.matchAll(EMAIL_LINE)) last = match[1] ?? null;
-    if (last) return last.replace(/[.,;)]+$/, "");
+    if (last) {
+      email = last.replace(/[.,;)]+$/, "");
+      break;
+    }
   }
-  return null;
+  emailCache.set(logDir, {
+    newestFile: newest.full,
+    newestMtime: newest.mtime,
+    newestSize: newest.size,
+    email,
+  });
+  return email;
 }
