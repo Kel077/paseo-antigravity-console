@@ -333,7 +333,7 @@ export function AccountsScreen({ theme, layout, navigation, host, observation }:
                   label={t("overview.default")}
                   value={data.defaultAccountId}
                   options={data.accounts
-                    .filter((account) => account.usable)
+                    .filter((account) => account.usable || account.id === data.defaultAccountId)
                     .map((account) => ({ value: account.id, label: displayLabel(account.label, t, account.kind) }))}
                   onValueChange={(accountId) => {
                     void setDefault({ accountId })

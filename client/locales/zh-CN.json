@@ -48,6 +48,7 @@
     "monthly": "每月"
   },
   "resets": "{{time}}重置",
+  "resetting": "即将重置",
   "off": "已停用",
   "noQuota": "没有额度数据",
   "action": {

@@ -49,6 +49,7 @@
     "monthly": "Monthly"
   },
   "resets": "Resets {{time}}",
+  "resetting": "Resetting soon",
   "off": "Off",
   "noQuota": "No quota reported",
   "action": {
