@@ -12,6 +12,7 @@ import { Avatar, Badge, Bar, Button, Callout, Card, Divider, hueFor, IconButton,
 export type CardAction =
   | "refresh"
   | "rename"
+  | "editNote"
   | "makeDefault"
   | "moveUp"
   | "moveDown"
@@ -242,6 +243,7 @@ export function AccountCard({
 
   const menuItems: Array<{ id: CardAction; label: string; icon: string; danger?: boolean }> = [
     { id: "rename", label: t("action.rename"), icon: "PenLine" },
+    { id: "editNote", label: account.note ? t("action.editNote") : t("action.addNote"), icon: "Tag" },
   ];
   if (!account.isDefaultForNewAgents && account.usable) {
     menuItems.push({ id: "makeDefault", label: t("action.makeDefault"), icon: "Star" });
@@ -297,6 +299,11 @@ export function AccountCard({
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.xs + 2 }}>
           <Badge colors={colors} label={statusLabel} tone={tone} dot />
           {account.plan ? <Badge colors={colors} label={account.plan} icon="Sparkles" /> : null}
+          {account.note ? (
+            <Pressable accessibilityRole="button" onPress={() => onAction("editNote")}>
+              <Badge colors={colors} label={account.note} tone="accent" icon="Tag" />
+            </Pressable>
+          ) : null}
           <Badge colors={colors} label={t(`kind.${account.kind}`)} icon={isProfile ? "UserRound" : "KeyRound"} />
           {!account.fallbackEnabled ? <Badge colors={colors} label={t("badgeNoFallback")} icon="ShieldOff" /> : null}
           {account.orchestratorOverride ? (

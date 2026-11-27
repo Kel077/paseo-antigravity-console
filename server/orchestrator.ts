@@ -4,6 +4,7 @@ import path from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   SYSTEM_ACCOUNT_ID,
+  accountSupportsModel,
   isAntigravityProvider,
   type ModelFamily,
   type OrchestratorChoice,
@@ -148,11 +149,19 @@ export class OrchestratorSettings {
   private writing: Promise<unknown> = Promise.resolve();
   private writeSeq = 0;
 
-  constructor(private readonly service: AccountService) {}
+  constructor(private readonly service: AccountService) {
+    this.service.setModelProvider((accountId) => this.cachedModelIds(accountId));
+  }
 
   invalidateAccount(accountId: string): void {
     this.catalogs.delete(accountId);
     this.failures.delete(accountId);
+  }
+
+  /** Cached agy model IDs and display labels for `accountId`, or null when not fetched yet. */
+  cachedModelIds(accountId: string): string[] | null {
+    const cached = this.catalogs.get(accountId);
+    return cached ? [...new Set(cached.models.flatMap(({ id, label }) => [id, label]))] : null;
   }
 
   /**
@@ -160,11 +169,7 @@ export class OrchestratorSettings {
    * catalog has not been fetched yet so callers do not falsely block an unchecked account.
    */
   supportsModel(accountId: string, model: string | null | undefined): boolean | null {
-    if (!model) return null;
-    const cached = this.catalogs.get(accountId);
-    if (!cached) return null;
-    const normalized = model.trim().toLowerCase().replace(/^antigravity\//, "");
-    return cached.models.some((entry) => entry.id.toLowerCase() === normalized || entry.label.toLowerCase() === normalized);
+    return accountSupportsModel({ supportedModels: this.cachedModelIds(accountId) }, model);
   }
 
   private catalog(accountId: string, identity: string, refresh: boolean): Promise<CatalogModel[] | null> {
@@ -192,7 +197,10 @@ export class OrchestratorSettings {
         return usable?.models ?? null;
       }
       this.failures.delete(accountId);
+      const prevIds = usable?.models.map((entry) => entry.id).join("\n") ?? "";
+      const nextIds = models.map((entry) => entry.id).join("\n");
       this.catalogs.set(accountId, { models, fetchedAt: Date.now(), identity });
+      if (prevIds !== nextIds) this.service.notifyChange();
       return models;
     })().finally(() => {
       if (this.fetching.get(accountId) === task) this.fetching.delete(accountId);
@@ -259,6 +267,8 @@ export class OrchestratorSettings {
     accountId?: string;
     inheritGlobal?: boolean;
   }): Promise<OrchestratorState> {
+    await this.service.store.load();
+    this.service.store.assertWritable();
     const state = await this.state();
     const known = (families: readonly ModelFamily[], label: string) =>
       families.some((family) => family.variants.some((variant) => variant.label === label));

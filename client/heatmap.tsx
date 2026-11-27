@@ -427,7 +427,7 @@ export function ActivityCalendar({
               borderWidth: 1,
               borderColor: colors.border,
               backgroundColor: colors.surface0,
-              shadowColor: "#000",
+              shadowColor: colors.foreground,
               shadowOpacity: 0.12,
               shadowRadius: 10,
               shadowOffset: { width: 0, height: 4 },

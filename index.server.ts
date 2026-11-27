@@ -1,5 +1,6 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
+  agentTasksRpc,
   cancelSignInRpc,
   clearCooldownRpc,
   contextUsageRpc,
@@ -7,14 +8,17 @@ import {
   getOrchestratorRpc,
   getPricingRpc,
   listAccountsRpc,
+  listAgentArtifactsRpc,
   listSubagentsRpc,
   migrateAccountAgentsRpc,
   moveAccountRpc,
+  readAgentArtifactRpc,
   recoverSavedFilesRpc,
   refreshAccountsRpc,
   removeAccountRpc,
   renameAccountRpc,
   savedFilesRpc,
+  searchArtifactsAttachmentRpc,
   setAccountOptionsRpc,
   setDefaultAccountRpc,
   setFallbackRpc,
@@ -32,6 +36,7 @@ import {
   watchAccountsSubscription,
 } from "./shared/contracts";
 import { AccountService } from "./server/accounts";
+import { ArtifactReader } from "./server/artifacts";
 import { ContextReader } from "./server/context";
 import { FallbackController } from "./server/fallback";
 import { PendingSwitches, migrateAccountAgents, registerHooks, switchAgentAccount } from "./server/hooks";
@@ -43,27 +48,39 @@ import { createUsageSource } from "./server/usage";
 
 export default function contribute(server: PluginServerContext) {
   const service = new AccountService();
-  const pending = new PendingSwitches();
+  const pending = new PendingSwitches(() => service.store.isWritable());
+  const accountState = async () => {
+    const state = await service.state();
+    return { ...state, problems: [...state.problems, ...pending.problems()] };
+  };
   const context = new ContextReader();
   const stats = new UsageStatsReader();
   const pricing = new PricingStore();
   const subagents = new SubagentReader(context);
+  const artifacts = new ArtifactReader(context, subagents);
   const orchestrator = new OrchestratorSettings(service);
   const ready = Promise.all([service.init(), pricing.load()]).then(() => undefined);
 
-  // Learn every account's state once in the background so the composer can show it.
+  // Learn every account's state and model catalog once in the background so pickers can show them.
   const warmup = setTimeout(() => {
-    void ready.then(() => service.refreshAll()).catch((error: unknown) => {
-      console.error("antigravity-accounts: initial refresh failed", error);
-    });
+    void ready
+      .then(async () => {
+        await service.refreshAll();
+        await orchestrator.state(false).catch(() => undefined);
+      })
+      .catch((error: unknown) => {
+        console.error("antigravity-accounts: initial refresh failed", error);
+      });
   }, 3000);
 
-  // Keep quota fresh for the sidebar: the default account often, every account now and then.
+  // Keep quota fresh for the sidebar: the active default account often, every account now and then.
   const quotaTimer = setInterval(() => {
     void ready
       .then(async () => {
         const state = await service.state();
-        await service.refreshOne(state.defaultAccountId);
+        if (state.resolvedDefaultAccountId) {
+          await service.refreshOne(state.resolvedDefaultAccountId);
+        }
       })
       .catch(() => undefined);
   }, 3 * 60_000);
@@ -72,21 +89,20 @@ export default function contribute(server: PluginServerContext) {
   }, 15 * 60_000);
 
   const fallback = new FallbackController(service, pending, orchestrator);
-  const removers = registerHooks(server, service, pending, fallback, {
-    onConversationAccount: (conversationId, accountId) => stats.recordConversationAccount(conversationId, accountId),
+  const removers = [fallback.register(server, () => registerHooks(server, service, pending, fallback, {
+    onConversationAccount: (conversationId, accountId, at) => stats.recordConversationAccount(conversationId, accountId, at),
     onAgentArchived: (agentId) => {
       context.forget(agentId);
       subagents.forget(agentId);
     },
-  });
-  removers.push(fallback.register(server));
+  }))];
   removers.push(...orchestrator.register(server));
   server.registerUsageSource(createUsageSource(service));
 
   server.handle(listAccountsRpc, async ({ refresh }) => {
     await ready;
     if (refresh) await service.refreshAll({ forcePlan: true });
-    return service.state();
+    return accountState();
   });
 
   server.handle(refreshAccountsRpc, async ({ accountId }) => {
@@ -94,54 +110,53 @@ export default function contribute(server: PluginServerContext) {
     if (accountId) {
       service.requireAccount(accountId);
       await service.refreshOne(accountId, { forcePlan: true });
-      orchestrator.invalidateAccount(accountId);
     } else {
       await service.refreshAll({ forcePlan: true });
     }
-    return service.state();
+    return accountState();
   });
 
   server.handle(createAccountRpc, async ({ label }) => {
     await ready;
     const account = await service.create(label);
-    return { account, state: await service.state() };
+    return { account, state: await accountState() };
   });
 
   server.handle(renameAccountRpc, async ({ accountId, label }) => {
     await ready;
     await service.rename(accountId, label);
-    return service.state();
+    return accountState();
   });
 
   server.handle(moveAccountRpc, async ({ accountId, direction }) => {
     await ready;
     await service.move(accountId, direction);
-    return service.state();
+    return accountState();
   });
 
-  server.handle(setAccountOptionsRpc, async ({ accountId, fallbackEnabled, orchestratorOverride }) => {
+  server.handle(setAccountOptionsRpc, async ({ accountId, fallbackEnabled, note, orchestratorOverride }) => {
     await ready;
-    await service.setAccountOptions(accountId, { fallbackEnabled, orchestratorOverride });
-    return service.state();
+    await service.setAccountOptions(accountId, { fallbackEnabled, note, orchestratorOverride });
+    return accountState();
   });
 
   server.handle(clearCooldownRpc, async ({ accountId }) => {
     await ready;
     if (accountId) service.requireAccount(accountId);
     fallback.clearCooldown(accountId);
-    return service.state();
+    return accountState();
   });
 
   server.handle(setFallbackRpc, async (patch) => {
     await ready;
     await service.setFallback(patch);
-    return service.state();
+    return accountState();
   });
 
   server.handle(setDefaultAccountRpc, async ({ accountId }) => {
     await ready;
     await service.setDefault(accountId);
-    return service.state();
+    return accountState();
   });
 
   server.handle(savedFilesRpc, async ({ accountId }) => {
@@ -157,18 +172,18 @@ export default function contribute(server: PluginServerContext) {
 
   server.handle(removeAccountRpc, async ({ accountId }) => {
     await ready;
-    fallback.clearCooldown(accountId);
     orchestrator.invalidateAccount(accountId);
     const moved = await service.remove(accountId);
-    return { state: await service.state(), moved };
+    fallback.clearCooldown(accountId);
+    return { state: await accountState(), moved };
   });
 
   server.handle(signOutAccountRpc, async ({ accountId }) => {
     await ready;
-    fallback.clearCooldown(accountId);
     orchestrator.invalidateAccount(accountId);
     await service.signOut(accountId);
-    return service.state();
+    fallback.clearCooldown(accountId);
+    return accountState();
   });
 
   server.handle(startSignInRpc, async ({ accountId }) => {
@@ -184,7 +199,7 @@ export default function contribute(server: PluginServerContext) {
       fallback.clearCooldown(accountId);
       orchestrator.invalidateAccount(accountId);
     }
-    return service.state();
+    return accountState();
   });
 
   server.handle(cancelSignInRpc, async ({ loginId }) => {
@@ -194,19 +209,23 @@ export default function contribute(server: PluginServerContext) {
 
   server.handle(switchAgentAccountRpc, async (input, { paseo }) => {
     await ready;
-    fallback.clearCooldown(input.accountId);
-    return switchAgentAccount(paseo, service, pending, { ...input, manual: true });
+    fallback.invalidatePreemptive(input.agentId);
+    fallback.clearCooldown(input.accountId, false);
+    return switchAgentAccount(paseo, service, pending, input);
   });
 
   server.handle(migrateAccountAgentsRpc, async (input, { paseo }) => {
     await ready;
-    fallback.clearCooldown(input.toAccountId);
-    return migrateAccountAgents(paseo, service, pending, input);
+    fallback.clearCooldown(input.toAccountId, false);
+    const outcome = await migrateAccountAgents(paseo, service, pending, input, (agentId) =>
+      fallback.invalidatePreemptive(agentId),
+    );
+    return outcome;
   });
 
-  server.handle(usageStatsRpc, async (filter) => {
+  server.handle(usageStatsRpc, async (filter, { paseo }) => {
     await ready;
-    return stats.summary(filter, (id) => service.labelOf(id), pricing.snapshot());
+    return stats.summary(filter, (id) => service.labelOf(id), pricing.snapshot(), paseo);
   });
 
   server.handle(usageDailyRpc, async (filter) => {
@@ -227,13 +246,18 @@ export default function contribute(server: PluginServerContext) {
     return pricing.state(seen);
   });
 
-  server.handle(contextUsageRpc, async ({ agentIds }, { paseo }) => context.usage(paseo, agentIds));
+  server.handle(contextUsageRpc, async ({ agentIds }, { paseo }) => {
+    await ready;
+    return context.usage(paseo, agentIds, pricing.snapshot());
+  });
 
   server.handle(listSubagentsRpc, async ({ agentId }, { paseo }) => subagents.list(paseo, agentId));
 
   server.handle(subagentCountsRpc, async ({ agentIds }, { paseo }) => ({
     counts: await subagents.counts(paseo, agentIds),
   }));
+
+  server.handle(agentTasksRpc, async ({ agentIds }, { paseo }) => subagents.latestTasks(paseo, agentIds));
 
   server.handle(subagentDetailRpc, async ({ agentId, subagentId }, { paseo }) =>
     subagents.detail(paseo, agentId, subagentId),
@@ -242,6 +266,14 @@ export default function contribute(server: PluginServerContext) {
   server.handle(subagentArtifactRpc, async ({ agentId, subagentId, path: artifactPath }, { paseo }) =>
     subagents.artifact(paseo, agentId, subagentId, artifactPath),
   );
+
+  server.handle(listAgentArtifactsRpc, async ({ agentId }, { paseo }) => artifacts.list(paseo, agentId));
+
+  server.handle(readAgentArtifactRpc, async ({ agentId, conversationId, path: artifactPath }, { paseo }) =>
+    artifacts.read(paseo, agentId, conversationId, artifactPath),
+  );
+
+  server.handle(searchArtifactsAttachmentRpc, async ({ query }) => artifacts.searchAttachments(query));
 
   server.handle(getOrchestratorRpc, async ({ refresh }) => {
     await ready;
@@ -271,6 +303,7 @@ export default function contribute(server: PluginServerContext) {
     for (const remove of removers) remove();
     fallback.dispose();
     stats.dispose();
+    subagents.dispose();
     service.dispose();
   };
 }
